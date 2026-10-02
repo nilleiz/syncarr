@@ -1,0 +1,46 @@
+# Copy this file to a private config location and mount it into the container.
+# Put endpoint URLs and API keys in environment variables; never add keys here.
+test_run: true
+
+instances:
+  source_a:
+    type: radarr
+    url_env: RADARR_A_URL
+    api_key_env: RADARR_A_KEY
+  source_b:
+    type: radarr
+    url_env: RADARR_B_URL
+    api_key_env: RADARR_B_KEY
+  target:
+    type: radarr
+    url_env: RADARR_TARGET_URL
+    api_key_env: RADARR_TARGET_KEY
+    delete_conflict_policy: keep_if_any_source
+
+jobs:
+  - id: movies_a
+    source: source_a
+    target: target
+    interval_seconds: 300
+    target_profile: HD
+    skip_missing: true
+    auto_search: true
+    monitor_new_content: true
+    root_mappings:
+      - source: /source-a/movies
+        target: /target/movies
+      - source: /source-a/documentaries
+        target: /target/documentaries
+    delete_missing: true
+    delete_scope: managed_only
+    delete_files: false
+
+  - id: movies_b
+    source: source_b
+    target: target
+    interval_seconds: 600
+    target_profile: HD
+    target_root_path: /target/movies
+    delete_missing: true
+    delete_scope: managed_only
+    delete_files: false

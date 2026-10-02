@@ -13,8 +13,29 @@ Syncs two Radarr/Sonarr/Lidarr servers through the web API. Useful for syncing a
 * Filter syncing by content file quality (Radarr only)
 * Filter syncing by tags (Sonarr/Radarr)
 * Allow for a test run using `test_run` flag (does everything but actually sync)
+* Run multiple independent source-to-target jobs in one process
+* Map source library roots to target library roots
+* Optionally remove missing, Syncarr-managed Radarr movies from a target
 
 ## Configuration
+
+### Multi-job mode
+
+Use multi-job mode when one process should run several source-to-target rules. The existing `config.conf` and single-pair environment variables continue to work when neither `SYNCARR_CONFIG` nor indexed multi-job variables are set.
+
+Start from [`syncarr.example.yml`](syncarr.example.yml). Set `SYNCARR_CONFIG` to its mounted path. The YAML defines named instances and jobs; set the environment variables named by each instance's `url_env` and `api_key_env` fields to provide connection details. Keep API keys outside the YAML file.
+
+The sample starts in `test_run` mode. Review the rules and logs, then set `test_run: false` when ready. Each job runs immediately and then follows its own `interval_seconds` value.
+
+`root_mappings` maps a source library root to a target library root. The longest matching source prefix is selected, with a directory boundary check. An item whose path matches none of a job's configured mappings is skipped and logged. With no mappings, `target_root_path` is used; if that is also absent, Syncarr uses the item's parent directory as the legacy fallback.
+
+For several sources sharing one target, `keep_if_any_source` is the default conflict policy: an item is retained while any configured source still contains it. `source_rule_wins` is available when each rule should make its own deletion decision.
+
+Deleting missing movies is disabled unless a job sets `delete_missing: true`. It applies only to Radarr. By default, `delete_scope: managed_only` deletes only movies tagged with the matching `syncarr-<job-id>` rule tag. This scope covers items tagged during multi-job operation; older untagged target items need `all_missing` or a manually added rule tag to be eligible. `all_missing` also considers movies that Syncarr did not tag. `delete_files` defaults to `false`, so Radarr removes the movie from its library and keeps its media file. On a shared target, the media file is removed only if every rule authorizing that deletion sets `delete_files: true`. Syncarr skips deletions for that target if it cannot read any configured source library needed to decide whether the movie is still present.
+
+You can configure multi-job mode entirely with indexed environment variables instead of YAML. Set `SYNCARR_INSTANCE_COUNT` and `SYNCARR_JOB_COUNT`, then provide `SYNCARR_INSTANCE_1_ID`, `_TYPE`, `_URL`, `_API_KEY` and corresponding numbered fields. Job fields use `SYNCARR_JOB_1_ID`, `_SOURCE`, `_TARGET`, `_INTERVAL_SECONDS`, `_ROOT_MAPPING_COUNT`, and `SYNCARR_JOB_1_ROOT_MAPPING_1_SOURCE` / `_TARGET`; optional job settings use the same names as the YAML keys in uppercase. Do not set `SYNCARR_CONFIG` at the same time.
+
+### Legacy single-pair mode
 
  1. Edit the config.conf file and enter your servers URLs and API keys for each server.  
  2. Add the profile name (case insensitive) and movie path for the Radarr instance the movies will be synced to:
@@ -58,7 +79,7 @@ Syncs two Radarr/Sonarr/Lidarr servers through the web API. Useful for syncing a
     path = /data/Music
     ```
     
-    **Note** you cannot have a mix of Radarr, Lidarr, or Sonarr config setups at the same time.
+    **Note:** Legacy single-pair mode supports one *arr type per configuration. Multi-job mode can define several jobs and instance pairs in one configuration.
 
  6. Optional Configuration
  
