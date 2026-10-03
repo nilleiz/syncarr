@@ -132,7 +132,7 @@ services:
       - ./syncarr.yml:/config/syncarr.yml:ro
 ```
 
-Set `SYNCARR_IMAGE` to the public GHCR image path. The local `.env` must define the endpoint URLs and API keys referenced in `syncarr.yml`; keep real values out of source control. The included sample config starts with `test_run: true`.
+Set `SYNCARR_IMAGE` to the GHCR image path. After its first publish, set the package visibility to Public. The local `.env` must define the endpoint URLs and API keys referenced in `syncarr.yml`; keep real values out of source control. The included sample config starts with `test_run: true`.
 
 Example local `.env` values (replace placeholders locally; do not commit this file):
 
