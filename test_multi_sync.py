@@ -8,7 +8,8 @@ from multi_config import _finish_config, _normalize_instance, _normalize_pair
 from multi_sync import (ArrClient, SyncError, _apply_sonarr_episode_plan,
                         _items_for_deletion, _passes_file_filters, _passes_filters,
                         _reinitialize_radarr_target, _run_planned_cycle,
-                        _sonarr_episode_plan, _sync_items, rule_tag, run_job, run_once)
+                        _resolve_source_filters, _sonarr_episode_plan, _sync_items,
+                        rule_tag, run_job, run_once)
 
 
 class FakeSonarrClient(object):
@@ -167,6 +168,8 @@ def _job(job_id, source, target, tag_id, **changes):
         },
         'source_profile_filter_id': None,
         'source_profile_filter': None,
+        'source_profile_filters': [],
+        'source_profile_filter_ids': [],
         'source_tag_filter_id': [],
         'source_tag_filter': [],
         'source_blacklist': [],
@@ -359,6 +362,56 @@ class RadarrRootPathTests(unittest.TestCase):
                          '/new/movies/Example Movie (2020)')
         self.assertEqual(target.calls[1][2]['path'],
                          '/new/movies/Example Movie (2020)')
+
+
+class SourceProfileFilterTests(unittest.TestCase):
+    def test_multiple_source_profile_names_and_ids_match_any_selected_profile(self):
+        source = FakeRadarrClient(('radarr', 'http://source'))
+        target = FakeRadarrClient(('radarr', 'http://target'))
+        job = _job('profile-filter', source, target, 7,
+                   has_file_filters=False,
+                   source_profile_filters=['sOuRcE oNe'],
+                   source_profile_filter_ids=[2])
+
+        selected_ids, tag_ids = _resolve_source_filters(source, job)
+
+        self.assertEqual(selected_ids, {1, 2})
+        self.assertTrue(_passes_filters(
+            {'qualityProfileId': 1, 'hasFile': True}, source, job, selected_ids, tag_ids))
+        self.assertTrue(_passes_filters(
+            {'qualityProfileId': 2, 'hasFile': True}, source, job, selected_ids, tag_ids))
+        self.assertFalse(_passes_filters(
+            {'qualityProfileId': 3, 'hasFile': True}, source, job, selected_ids, tag_ids))
+
+    def test_multiple_source_profile_filters_apply_to_sonarr(self):
+        source = FakeSonarrClient(('sonarr', 'http://source'))
+        target = FakeSonarrClient(('sonarr', 'http://target'))
+        job = _job('profile-filter', source, target, 7,
+                   has_file_filters=False,
+                   source_profile_filters=['Source One'],
+                   source_profile_filter_ids=[2])
+
+        selected_ids, tag_ids = _resolve_source_filters(source, job)
+
+        self.assertEqual(selected_ids, {1, 2})
+        self.assertTrue(_passes_filters(
+            {'qualityProfileId': 1}, source, job, selected_ids, tag_ids))
+        self.assertTrue(_passes_filters(
+            {'qualityProfileId': 2}, source, job, selected_ids, tag_ids))
+        self.assertFalse(_passes_filters(
+            {'qualityProfileId': 3}, source, job, selected_ids, tag_ids))
+
+    def test_legacy_single_source_profile_filter_id_remains_compatible(self):
+        source = FakeRadarrClient(('radarr', 'http://source'))
+        target = FakeRadarrClient(('radarr', 'http://target'))
+        job = _job('profile-filter', source, target, 7,
+                   has_file_filters=False, source_profile_filter_id=2)
+
+        selected_id, unused_tag_ids = _resolve_source_filters(source, job)
+
+        self.assertEqual(selected_id, 2)
+        self.assertTrue(_passes_filters(
+            {'qualityProfileId': 2, 'hasFile': True}, source, job, selected_id, set()))
 
 
 class ArrPairCycleTests(unittest.TestCase):
@@ -721,6 +774,30 @@ class ArrPairCycleTests(unittest.TestCase):
 
 
 class RadarrDeletionPresenceTests(unittest.TestCase):
+    def test_profile_transfer_filter_does_not_change_radarr_file_presence(self):
+        source_a = FakeRadarrClient(('radarr', 'http://source-a'))
+        source_b = FakeRadarrClient(('radarr', 'http://source-b'))
+        target_item = {'id': 20, 'tmdbId': 100, 'tags': [8]}
+        target = FakeRadarrClient(('radarr', 'http://target'), [target_item])
+        filtered_job = _job('profile-filter', source_a, target, 7,
+                            has_file_filters=False,
+                            source_profile_filters=['Other Profile'])
+        deleting_job = _job('delete', source_b, target, 8,
+                            delete_missing=True, delete_scope='all_missing',
+                            has_file_filters=False, source_quality_match=None)
+        snapshots = {
+            source_a.identity: {'contents': [{
+                'id': 10, 'tmdbId': 100, 'hasFile': True, 'qualityProfileId': 1,
+            }]},
+            source_b.identity: {'contents': []},
+        }
+
+        candidates = _items_for_deletion(
+            [target_item], [filtered_job, deleting_job], snapshots, target)
+
+        self.assertEqual(candidates, [])
+
+
     def make_fixture(self, source_movies, **changes):
         source = FakeRadarrClient(('radarr', 'http://source'), source_movies)
         target_item = {'id': 20, 'tmdbId': 100, 'tags': [7]}

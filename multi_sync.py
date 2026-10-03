@@ -277,9 +277,27 @@ def _path_for_content(content, job, target_client):
 
 
 def _resolve_source_filters(client, job):
-    profile_filter_id = job['source_profile_filter_id']
-    if profile_filter_id is None and job['source_profile_filter']:
-        profile_filter_id = client.profile_id(job['source_profile_filter'], None, 'source profile filter')
+    multiple_profile_ids = set(job['source_profile_filter_ids'])
+    if job['source_profile_filters']:
+        profiles = client.profiles()
+        by_name = {}
+        for profile in profiles:
+            name = str(profile.get('name', '')).casefold()
+            if name:
+                by_name.setdefault(name, []).append(profile)
+        for name in job['source_profile_filters']:
+            matches = by_name.get(name.casefold(), [])
+            if len(matches) != 1:
+                raise SyncError('Could not resolve source profile filter on the configured instance')
+            multiple_profile_ids.add(matches[0]['id'])
+        profile_filter_id = multiple_profile_ids or None
+    elif multiple_profile_ids:
+        profile_filter_id = multiple_profile_ids
+    else:
+        profile_filter_id = job['source_profile_filter_id']
+        if profile_filter_id is None and job['source_profile_filter']:
+            profile_filter_id = client.profile_id(
+                job['source_profile_filter'], None, 'source profile filter')
     tag_filter_ids = list(job['source_tag_filter_id'])
     if job['source_tag_filter']:
         labels = {str(item.get('label', '')).lower(): item.get('id') for item in client.tags()}
@@ -292,8 +310,13 @@ def _resolve_source_filters(client, job):
 
 
 def _passes_filters(content, client, job, profile_filter_id, tag_filter_ids):
-    if profile_filter_id is not None and content.get('qualityProfileId') != profile_filter_id:
-        return False
+    if profile_filter_id is not None:
+        source_profile_id = content.get('qualityProfileId')
+        if isinstance(profile_filter_id, (set, frozenset, list, tuple)):
+            if profile_filter_id and source_profile_id not in profile_filter_id:
+                return False
+        elif source_profile_id != profile_filter_id:
+            return False
     if tag_filter_ids and not (set(content.get('tags') or []) & tag_filter_ids):
         return False
     blacklist = set(job['source_blacklist'])

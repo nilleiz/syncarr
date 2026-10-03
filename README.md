@@ -30,6 +30,8 @@ The sample starts in `test_run` mode. Review the rules and logs, then set `test_
 
 Each pair connects two distinct instances of the same type. Radarr and Sonarr pairs use the same structure. Add as many uniquely named rules and profile mappings as needed. Rules inherit pair settings such as roots, monitoring, search, filters, dry-run, and deletion options; a value on a rule overrides that pair default. Rule IDs are unique within their pair.
 
+Radarr and Sonarr rules can be scoped to source quality profiles. Existing `source_profile_filter` and `source_profile_filter_id` select one profile. For multiple profiles, use `source_profile_filters` (names) and/or `source_profile_filter_ids` (IDs); the selected profiles are combined as an allowlist, so a match to any listed profile qualifies. Names match case-insensitively. Do not combine singular and plural settings on the same rule. On pair rules, choosing one form replaces the opposite form inherited from the pair. Profile selection controls syncing; it does not change Radarr's `hasFile`-based deletion presence.
+
 Map each source quality profile to an existing target profile by name or ID. Syncarr validates every configured profile before it writes to that target and never creates profiles. Unmapped source profiles are skipped. A mapped profile change updates an existing target movie or series, including one with a file; it does not change that item's path or move media. If applicable rules demand different profiles, roots, or monitoring states, Syncarr skips that target item and protects it from deletion for the run.
 
 The rule filters remain application-specific: Radarr checks movie files, and Sonarr checks episode files. Sonarr combines matching episodes across rules for monitoring and search. Its deletion behavior remains episode-based; a nonmatching episode never deletes the whole series. A shared episode file is removed only when every episode in it is authorized for deletion.
@@ -74,6 +76,17 @@ source_custom_format_names:
 source_custom_format_exclude_names:
   - HDR10 fallback
 ```
+
+For profile selection, keep using `source_profile_filter` / `source_profile_filter_id` for one profile. For an allowlist of several profiles, use either names, IDs, or both:
+
+```yaml
+source_profile_filters:
+  - Profile A
+  - Profile B
+source_profile_filter_ids: [3, 4]
+```
+
+Indexed environment configuration uses `SOURCE_PROFILE_FILTERS` and `SOURCE_PROFILE_FILTER_IDS` with comma-separated values. Examples: `SYNCARR_JOB_1_SOURCE_PROFILE_FILTERS=HD,UHD` or `SYNCARR_PAIR_1_RULE_1_SOURCE_PROFILE_FILTER_IDS=3,4`.
 
 Radarr only, to let this filtered job delete a target movie when none of its source files pass those filters:
 
