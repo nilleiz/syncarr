@@ -4,29 +4,50 @@ import unittest
 from unittest.mock import patch
 
 import index
+from multi_config import _finish_config, _normalize_instance, _normalize_pair
 from multi_sync import (ArrClient, SyncError, _apply_sonarr_episode_plan,
                         _items_for_deletion, _passes_file_filters, _passes_filters,
-                        _reinitialize_radarr_target, _sonarr_episode_plan, _sync_items,
-                        rule_tag, run_job, run_once)
+                        _reinitialize_radarr_target, _run_planned_cycle,
+                        _sonarr_episode_plan, _sync_items, rule_tag, run_job, run_once)
 
 
 class FakeSonarrClient(object):
-    def __init__(self, identity, episodes=None, tag_ids=None):
+    def __init__(self, identity, episodes=None, tag_ids=None, items=None, profiles=None):
         self.identity = identity
         self.arr_type = 'sonarr'
         self.url = identity[1]
         self.episodes = episodes or {}
         self.tag_ids = tag_ids or {}
+        self.items = list(items or [])
+        self.profile_records = profiles or [
+            {'id': 1, 'name': 'Source One'}, {'id': 2, 'name': 'Source Two'},
+            {'id': 11, 'name': 'Target One'}, {'id': 12, 'name': 'Target Two'},
+        ]
+        self.content_route = 'series'
+        self.list_content_calls = 0
         self.calls = []
+
+    def list_content(self):
+        self.list_content_calls += 1
+        return list(self.items)
+
+    def profiles(self):
+        return self.profile_records
 
     def list_episodes(self, series_id):
         return self.episodes[str(series_id)]
 
     def tag_id(self, label, create=False):
+        if label not in self.tag_ids and create:
+            self.tag_ids[label] = max([0] + list(self.tag_ids.values())) + 1
         return self.tag_ids.get(label)
 
     def request(self, method, route, params=None, payload=None, expected=None):
         self.calls.append((method, route, params, payload))
+        if method == 'POST' and route == 'series':
+            result = dict(payload, id=20)
+            self.items.append(result)
+            return result
         return None
 
     def set_episodes_monitored(self, episode_ids, monitored):
@@ -51,7 +72,7 @@ class FakeSonarrAddTarget(object):
 
 
 class FakeRadarrClient(object):
-    def __init__(self, identity, items=None, error=None, movie_file_error=None):
+    def __init__(self, identity, items=None, error=None, movie_file_error=None, profiles=None):
         self.identity = identity
         self.arr_type = 'radarr'
         self.content_route = 'movie'
@@ -62,6 +83,10 @@ class FakeRadarrClient(object):
         self.movie_files = {}
         self.movie_file_calls = []
         self.tag_ids = {}
+        self.profile_records = profiles or [
+            {'id': 1, 'name': 'Source One'}, {'id': 2, 'name': 'Source Two'},
+            {'id': 11, 'name': 'Target One'}, {'id': 12, 'name': 'Target Two'},
+        ]
         self.deleted_movies = []
         self.list_content_calls = 0
         self.calls = []
@@ -81,7 +106,12 @@ class FakeRadarrClient(object):
     def profile_id(self, name, explicit_id, setting_name):
         return explicit_id
 
+    def profiles(self):
+        return self.profile_records
+
     def tag_id(self, label, create=False):
+        if label not in self.tag_ids and create:
+            self.tag_ids[label] = max([0] + list(self.tag_ids.values())) + 1
         return self.tag_ids.get(label)
 
     def request(self, method, route, params=None, payload=None, expected=None):
@@ -329,6 +359,365 @@ class RadarrRootPathTests(unittest.TestCase):
                          '/new/movies/Example Movie (2020)')
         self.assertEqual(target.calls[1][2]['path'],
                          '/new/movies/Example Movie (2020)')
+
+
+class ArrPairCycleTests(unittest.TestCase):
+    def make_config(self, arr_type, pair_specs):
+        instances = {}
+        for instance_id, url in [('source_a', 'http://source-a'),
+                                 ('source_b', 'http://source-b'),
+                                 ('target', 'http://target')]:
+            instances[instance_id] = _normalize_instance(
+                instance_id, arr_type, url, 'placeholder')
+        pairs = [_normalize_pair(spec, index, instances, False)
+                 for index, spec in enumerate(pair_specs, start=1)]
+        return _finish_config(instances, [], False, pairs=pairs)
+
+    def default_mapping(self, source_id=1, target_id=11):
+        return [{'source_profile_id': source_id, 'target_profile_id': target_id}]
+
+    def test_radarr_pair_changes_profile_in_both_directions_without_moving_files(self):
+        for source_profile, old_target_profile, expected_target_profile in (
+                (1, 12, 11), (2, 11, 12)):
+            source = FakeRadarrClient(('radarr', 'http://source-a'), [{
+                'id': 10, 'tmdbId': 100, 'title': 'Movie',
+                'path': '/source/movies/Movie', 'hasFile': True,
+                'qualityProfileId': source_profile, 'monitored': True,
+            }])
+            target_movie = {
+                'id': 20, 'tmdbId': 100, 'title': 'Movie',
+                'path': '/target/movies/Movie', 'rootFolderPath': '/target/movies',
+                'hasFile': True, 'movieFile': {'id': 201},
+                'qualityProfileId': old_target_profile, 'tags': [],
+            }
+            target = FakeRadarrClient(('radarr', 'http://target'), [target_movie])
+            config = self.make_config('radarr', [{
+                'id': 'movies', 'source': 'source_a', 'target': 'target',
+                'profile_mappings': [
+                    {'source_profile_id': 1, 'target_profile_id': 11},
+                    {'source_profile_id': 2, 'target_profile_id': 12},
+                ],
+                'rules': [{'id': 'all'}],
+            }])
+            clients = {source.identity: source, target.identity: target}
+
+            self.assertTrue(_run_planned_cycle(config, config['all_jobs'], clients))
+
+            updates = [call for call in target.calls if call[0] == 'PUT']
+            self.assertEqual(len(updates), 1)
+            payload = updates[0][3]
+            self.assertEqual(payload['qualityProfileId'], expected_target_profile)
+            self.assertEqual(payload['path'], '/target/movies/Movie')
+            self.assertEqual(payload['rootFolderPath'], '/target/movies')
+            self.assertIsNone(updates[0][2])
+
+    def test_multiple_rules_share_inventory_and_update_one_target_record(self):
+        source = FakeRadarrClient(('radarr', 'http://source-a'), [{
+            'id': 10, 'tmdbId': 100, 'title': 'Movie',
+            'path': '/source/movies/Movie', 'hasFile': True,
+            'qualityProfileId': 1, 'monitored': True,
+        }])
+        target = FakeRadarrClient(('radarr', 'http://target'), [{
+            'id': 20, 'tmdbId': 100, 'title': 'Movie',
+            'path': '/target/movies/Movie', 'rootFolderPath': '/target/movies',
+            'hasFile': True, 'movieFile': {'id': 201},
+            'qualityProfileId': 11, 'tags': [],
+        }])
+        config = self.make_config('radarr', [{
+            'id': 'movies', 'source': 'source_a', 'target': 'target',
+            'profile_mappings': self.default_mapping(),
+            'rules': [{'id': 'first'}, {'id': 'second'}],
+        }])
+
+        self.assertTrue(_run_planned_cycle(config, config['all_jobs'],
+                                           {source.identity: source, target.identity: target}))
+
+        self.assertEqual(source.list_content_calls, 1)
+        self.assertEqual(target.list_content_calls, 1)
+        updates = [call for call in target.calls if call[0] == 'PUT']
+        self.assertEqual(len(updates), 1)
+        self.assertEqual(len(updates[0][3]['tags']), 2)
+
+    def test_profile_conflict_across_pairs_skips_update_and_protects_entity(self):
+        source_a = FakeRadarrClient(('radarr', 'http://source-a'), [{
+            'id': 10, 'tmdbId': 100, 'title': 'Movie',
+            'path': '/source/movies/Movie', 'hasFile': True,
+            'qualityProfileId': 1, 'monitored': True,
+        }])
+        source_b = FakeRadarrClient(('radarr', 'http://source-b'), [{
+            'id': 11, 'tmdbId': 100, 'title': 'Movie',
+            'path': '/source-b/movies/Movie', 'hasFile': True,
+            'qualityProfileId': 2, 'monitored': True,
+        }])
+        target = FakeRadarrClient(('radarr', 'http://target'), [{
+            'id': 20, 'tmdbId': 100, 'title': 'Movie',
+            'path': '/target/movies/Movie', 'rootFolderPath': '/target/movies',
+            'hasFile': True, 'movieFile': {'id': 201},
+            'qualityProfileId': 11, 'tags': [],
+        }])
+        config = self.make_config('radarr', [
+            {'id': 'first', 'source': 'source_a', 'target': 'target',
+             'profile_mappings': self.default_mapping(1, 11),
+             'rules': [{'id': 'rule', 'delete_missing': True,
+                        'delete_scope': 'all_missing'}]},
+            {'id': 'second', 'source': 'source_b', 'target': 'target',
+             'profile_mappings': self.default_mapping(2, 12),
+             'rules': [{'id': 'rule', 'delete_missing': True,
+                        'delete_scope': 'all_missing'}]},
+        ])
+        clients = {source_a.identity: source_a, source_b.identity: source_b,
+                   target.identity: target}
+
+        self.assertTrue(_run_planned_cycle(config, [config['pairs'][0]['jobs'][0]], clients))
+
+        self.assertEqual(target.calls, [])
+        self.assertEqual(target.deleted_movies, [])
+
+    def test_pair_dry_run_logs_profile_update_without_writing(self):
+        source = FakeRadarrClient(('radarr', 'http://source-a'), [{
+            'id': 10, 'tmdbId': 100, 'title': 'Movie',
+            'path': '/source/movies/Movie', 'hasFile': True,
+            'qualityProfileId': 1, 'monitored': True,
+        }])
+        target = FakeRadarrClient(('radarr', 'http://target'), [{
+            'id': 20, 'tmdbId': 100, 'title': 'Movie',
+            'path': '/target/movies/Movie', 'rootFolderPath': '/target/movies',
+            'hasFile': True, 'movieFile': {'id': 201},
+            'qualityProfileId': 12, 'tags': [],
+        }])
+        config = self.make_config('radarr', [{
+            'id': 'movies', 'source': 'source_a', 'target': 'target',
+            'test_run': True, 'profile_mappings': self.default_mapping(),
+            'rules': [{'id': 'all'}],
+        }])
+
+        with self.assertLogs('syncarr', level='INFO') as captured:
+            self.assertTrue(_run_planned_cycle(
+                config, config['all_jobs'], {source.identity: source, target.identity: target}))
+
+        events = _entity_events(captured)
+        update = next(event for event in events if event['action'] == 'update')
+        self.assertEqual(update['mode'], 'dry_run')
+        self.assertIn('quality_profile_changed', update['change_reasons'])
+        self.assertEqual(update['pair_id'], 'movies')
+        self.assertEqual(update['rule_id'], 'all')
+        self.assertEqual(target.calls, [])
+        self.assertEqual(target.tag_ids, {})
+
+    def test_missing_configured_profile_blocks_target_writes(self):
+        source = FakeRadarrClient(('radarr', 'http://source-a'), [{
+            'id': 10, 'tmdbId': 100, 'title': 'Movie',
+            'path': '/source/movies/Movie', 'hasFile': True,
+            'qualityProfileId': 1, 'monitored': True,
+        }], profiles=[{'id': 2, 'name': 'Source Two'}])
+        target = FakeRadarrClient(('radarr', 'http://target'), profiles=[
+            {'id': 11, 'name': 'Target One'},
+        ])
+        config = self.make_config('radarr', [{
+            'id': 'movies', 'source': 'source_a', 'target': 'target',
+            'profile_mappings': self.default_mapping(),
+            'rules': [{'id': 'all'}],
+        }])
+
+        self.assertFalse(_run_planned_cycle(
+            config, config['all_jobs'], {source.identity: source, target.identity: target}))
+
+        self.assertEqual(target.calls, [])
+        self.assertEqual(target.tag_ids, {})
+
+    def test_conflicting_root_and_monitor_demands_skip_new_entity(self):
+        source = FakeRadarrClient(('radarr', 'http://source-a'), [{
+            'id': 10, 'tmdbId': 100, 'title': 'Movie',
+            'path': '/source/movies/Movie', 'hasFile': True,
+            'qualityProfileId': 1, 'monitored': True,
+        }])
+        target = FakeRadarrClient(('radarr', 'http://target'))
+        config = self.make_config('radarr', [
+            {'id': 'first', 'source': 'source_a', 'target': 'target',
+             'profile_mappings': self.default_mapping(),
+             'root_mappings': [{'source': '/source/movies', 'target': '/target/one'}],
+             'monitor_new_content': True, 'rules': [{'id': 'rule'}]},
+            {'id': 'second', 'source': 'source_a', 'target': 'target',
+             'profile_mappings': self.default_mapping(),
+             'root_mappings': [{'source': '/source/movies', 'target': '/target/two'}],
+             'monitor_new_content': False, 'rules': [{'id': 'rule'}]},
+        ])
+
+        self.assertTrue(_run_planned_cycle(
+            config, config['all_jobs'], {source.identity: source, target.identity: target}))
+
+        self.assertEqual(target.calls, [])
+        self.assertEqual(target.tag_ids, {})
+
+    def test_sonarr_pair_changes_profile_on_existing_series_without_path_change(self):
+        source = FakeSonarrClient(('sonarr', 'http://source-a'), items=[{
+            'id': 10, 'tvdbId': 100, 'title': 'Series',
+            'path': '/source/shows/Series', 'qualityProfileId': 1, 'monitored': True,
+        }])
+        target = FakeSonarrClient(('sonarr', 'http://target'), items=[{
+            'id': 20, 'tvdbId': 100, 'title': 'Series',
+            'path': '/target/shows/Series', 'rootFolderPath': '/target/shows',
+            'qualityProfileId': 12, 'monitored': True, 'tags': [],
+        }])
+        config = self.make_config('sonarr', [{
+            'id': 'shows', 'source': 'source_a', 'target': 'target',
+            'profile_mappings': self.default_mapping(1, 11),
+            'rules': [{'id': 'all'}],
+        }])
+
+        self.assertTrue(_run_planned_cycle(
+            config, config['all_jobs'], {source.identity: source, target.identity: target}))
+
+        update = next(call for call in target.calls if call[0] == 'PUT')
+        self.assertEqual(update[1], 'series/20')
+        self.assertEqual(update[3]['qualityProfileId'], 11)
+        self.assertEqual(update[3]['path'], '/target/shows/Series')
+        self.assertEqual(update[3]['rootFolderPath'], '/target/shows')
+
+    def test_filtered_new_sonarr_series_monitors_and_searches_only_matching_episodes(self):
+        source_episodes = [
+            dict(_episode(1, 101, True, 'Bluray-2160p', []), id=1),
+            dict(_episode(2, 102, True, 'WEB-2160p', []), id=2),
+        ]
+        source = FakeSonarrClient(
+            ('sonarr', 'http://source-a'), episodes={'10': source_episodes}, items=[{
+                'id': 10, 'tvdbId': 100, 'title': 'Series',
+                'path': '/source/shows/Series', 'qualityProfileId': 1,
+                'monitored': True, 'seasons': [{'seasonNumber': 1, 'monitored': True}],
+            }])
+        target_episodes = [
+            _episode(1, 0, False, None), _episode(2, 0, False, None),
+        ]
+        target = FakeSonarrClient(('sonarr', 'http://target'), episodes={'20': target_episodes})
+        config = self.make_config('sonarr', [{
+            'id': 'shows', 'source': 'source_a', 'target': 'target',
+            'profile_mappings': self.default_mapping(1, 11),
+            'rules': [{'id': 'hd', 'source_quality_match': '^Bluray'}],
+        }])
+
+        self.assertTrue(_run_planned_cycle(
+            config, config['all_jobs'], {source.identity: source, target.identity: target}))
+
+        add = next(call for call in target.calls if call[0] == 'POST' and call[1] == 'series')
+        self.assertFalse(add[3]['addOptions']['searchForMissingEpisodes'])
+        self.assertEqual(add[3]['qualityProfileId'], 11)
+        self.assertIn(('MONITOR', [51], True), target.calls)
+        search = next(call for call in target.calls
+                      if call[0] == 'POST' and call[1] == 'command')
+        self.assertEqual(search[3]['episodeIds'], [51])
+
+    def test_sonarr_unknown_filter_metadata_prevents_episode_deletion(self):
+        incomplete_episode = {
+            'id': 1, 'seasonNumber': 1, 'episodeNumber': 1,
+            'episodeFileId': 101, 'hasFile': True,
+            'episodeFile': {'id': 101, 'customFormats': []},
+        }
+        source = FakeSonarrClient(
+            ('sonarr', 'http://source-a'), episodes={'10': [incomplete_episode]}, items=[{
+                'id': 10, 'tvdbId': 100, 'title': 'Series',
+                'path': '/source/shows/Series', 'qualityProfileId': 1,
+                'monitored': True,
+            }])
+        target_episode = _episode(1, 500, True, 'Bluray-2160p', [])
+        target = FakeSonarrClient(('sonarr', 'http://target'),
+                                  episodes={'20': [target_episode]}, items=[{
+            'id': 20, 'tvdbId': 100, 'title': 'Series',
+            'path': '/target/shows/Series', 'qualityProfileId': 11,
+            'monitored': True, 'tags': [],
+        }])
+        config = self.make_config('sonarr', [{
+            'id': 'shows', 'source': 'source_a', 'target': 'target',
+            'profile_mappings': self.default_mapping(),
+            'rules': [{'id': 'hd', 'source_quality_match': '^Bluray',
+                       'delete_missing': True, 'delete_scope': 'all_missing',
+                       'delete_files': True}],
+        }])
+
+        self.assertFalse(_run_planned_cycle(
+            config, config['all_jobs'], {source.identity: source, target.identity: target}))
+
+        self.assertEqual(target.calls, [])
+
+    def test_dry_run_sonarr_delete_does_not_apply_beside_live_rule(self):
+        matching_source_episode = dict(
+            _episode(1, 101, True, 'Bluray-2160p',
+                     [{'name': 'Dolby Vision without fallback'}]), id=1)
+        source_a = FakeSonarrClient(
+            ('sonarr', 'http://source-a'), episodes={'10': [matching_source_episode]},
+            items=[{'id': 10, 'tvdbId': 100, 'title': 'Series',
+                    'path': '/source/shows/Series', 'qualityProfileId': 1,
+                    'monitored': True}])
+        source_b = FakeSonarrClient(
+            ('sonarr', 'http://source-b'), episodes={'11': [dict(matching_source_episode, id=2)]},
+            items=[{'id': 11, 'tvdbId': 100, 'title': 'Series',
+                    'path': '/source-b/shows/Series', 'qualityProfileId': 1,
+                    'monitored': True}])
+        target = FakeSonarrClient(
+            ('sonarr', 'http://target'), episodes={'20': [
+                _episode(1, 501, False, 'Bluray-2160p',
+                         [{'name': 'Dolby Vision without fallback'}]),
+                _episode(2, 502, True, 'Bluray-2160p',
+                         [{'name': 'Dolby Vision without fallback'}]),
+            ]}, items=[{'id': 20, 'tvdbId': 100, 'title': 'Series',
+                        'path': '/target/shows/Series', 'qualityProfileId': 11,
+                        'monitored': True, 'tags': []}])
+        config = self.make_config('sonarr', [
+            {'id': 'dry', 'source': 'source_a', 'target': 'target',
+             'profile_mappings': self.default_mapping(),
+             'rules': [{'id': 'delete', 'test_run': True, 'delete_missing': True,
+                        'delete_scope': 'all_missing', 'delete_files': True,
+                        'source_quality_match': '^Bluray',
+                        'source_custom_format_mode': 'any',
+                        'source_custom_format_names': ['Dolby Vision without fallback']} ]},
+            {'id': 'live', 'source': 'source_b', 'target': 'target',
+             'profile_mappings': self.default_mapping(),
+             'rules': [{'id': 'monitor', 'source_quality_match': '^Bluray',
+                        'source_custom_format_mode': 'any',
+                        'source_custom_format_names': ['Dolby Vision without fallback']} ]},
+        ])
+        clients = {source_a.identity: source_a, source_b.identity: source_b,
+                   target.identity: target}
+
+        with self.assertLogs('syncarr', level='INFO') as captured:
+            self.assertTrue(_run_planned_cycle(config, config['all_jobs'], clients))
+
+        events = _entity_events(captured)
+        deletion = next(event for event in events
+                        if event['action'] == 'delete_episode_file')
+        self.assertEqual(deletion['mode'], 'dry_run')
+        self.assertEqual(deletion['outcome'], 'would_apply')
+        self.assertIn(('MONITOR', [51], True), target.calls)
+        self.assertFalse(any(call[0] == 'DELETE_FILE' for call in target.calls))
+
+    def test_one_time_pair_run_reuses_target_inventory_for_radarr_recovery(self):
+        source = FakeRadarrClient(('radarr', 'http://source-a'), [{
+            'id': 10, 'tmdbId': 100, 'title': 'Movie',
+            'path': '/source/movies/Movie', 'hasFile': True,
+            'qualityProfileId': 1, 'monitored': False,
+        }])
+        target = FakeRadarrClient(('radarr', 'http://target'), [{
+            'id': 20, 'tmdbId': 100, 'title': 'Movie',
+            'path': '/old/movies/Movie', 'rootFolderPath': '/old/movies',
+            'hasFile': False, 'qualityProfileId': 11, 'monitored': False, 'tags': [],
+        }])
+        config = self.make_config('radarr', [{
+            'id': 'movies', 'source': 'source_a', 'target': 'target',
+            'profile_mappings': self.default_mapping(),
+            'root_mappings': [{'source': '/source/movies', 'target': '/target/movies'}],
+            'rules': [{'id': 'all'}],
+        }])
+
+        with patch('multi_sync._create_clients',
+                   return_value={source.identity: source, target.identity: target}):
+            result = run_once(config)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(target.list_content_calls, 1)
+        self.assertIn(('SEARCH_MOVIES', [20]), target.calls)
+        self.assertTrue(any(call[0] == 'UPDATE_MOVIE' for call in target.calls))
+        path_update = next(call for call in target.calls if call[0] == 'PUT')
+        self.assertEqual(path_update[2], {'moveFiles': 'false'})
+        self.assertEqual(path_update[3]['path'], '/target/movies/Movie')
 
 
 class RadarrDeletionPresenceTests(unittest.TestCase):
