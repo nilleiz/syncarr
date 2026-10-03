@@ -2,7 +2,8 @@ import os
 import tempfile
 import unittest
 
-from multi_config import ConfigurationError, _normalize_instance, _normalize_job, load_multi_job_config
+from multi_config import (ConfigurationError, _normalize_instance, _normalize_job,
+                          _normalize_pair, load_multi_job_config)
 
 
 class MultiJobConfigTests(unittest.TestCase):
@@ -39,6 +40,46 @@ class MultiJobConfigTests(unittest.TestCase):
             'source_custom_format_minimum_score': -10,
         })
         self.assertEqual(job['source_custom_format_minimum_score'], -10)
+
+    def test_multiple_source_profile_filters_accept_names_and_ids(self):
+        job = self.normalize({
+            'source_profile_filters': ['HD', '4K'],
+            'source_profile_filter_ids': [3, 4],
+        })
+        self.assertEqual(job['source_profile_filters'], ['HD', '4K'])
+        self.assertEqual(job['source_profile_filter_ids'], [3, 4])
+
+    def test_single_and_multiple_source_profile_filters_cannot_be_combined(self):
+        with self.assertRaisesRegex(ConfigurationError, 'cannot combine singular and multiple'):
+            self.normalize({
+                'source_profile_filter': 'HD',
+                'source_profile_filters': ['4K'],
+            })
+
+    def test_multiple_source_profile_filters_require_radarr_or_sonarr(self):
+        lidarr_instances = {
+            'source': _normalize_instance('source', 'lidarr', 'http://source', 'key'),
+            'target': _normalize_instance('target', 'lidarr', 'http://target', 'key'),
+        }
+        with self.assertRaisesRegex(ConfigurationError, 'require Radarr or Sonarr'):
+            _normalize_job(dict(self.base_job, source_profile_filters=['Music']),
+                           1, lidarr_instances, False)
+
+    def test_rule_allowlist_overrides_pair_single_profile_filter(self):
+        pair = _normalize_pair({
+            'id': 'shows', 'source': 'source', 'target': 'target',
+            'source_profile_filter': 'HD',
+            'profile_mappings': [{'source_profile_id': 1, 'target_profile_id': 2}],
+            'rules': [
+                {'id': 'multi', 'source_profile_filters': ['HD', 'UHD']},
+                {'id': 'default'},
+            ],
+        }, 1, self.instances, False)
+
+        multi, default = pair['jobs']
+        self.assertIsNone(multi['source_profile_filter'])
+        self.assertEqual(multi['source_profile_filters'], ['HD', 'UHD'])
+        self.assertEqual(default['source_profile_filter'], 'HD')
 
     def test_custom_format_any_requires_names(self):
         with self.assertRaises(ConfigurationError):
@@ -94,11 +135,15 @@ class MultiJobConfigTests(unittest.TestCase):
             'SYNCARR_JOB_1_SOURCE_CUSTOM_FORMAT_MODE': 'all',
             'SYNCARR_JOB_1_SOURCE_CUSTOM_FORMAT_NAMES': 'DV, HDR',
             'SYNCARR_JOB_1_SOURCE_CUSTOM_FORMAT_EXCLUDE_NAMES': 'SDR fallback',
+            'SYNCARR_JOB_1_SOURCE_PROFILE_FILTERS': 'HD, UHD',
+            'SYNCARR_JOB_1_SOURCE_PROFILE_FILTER_IDS': '2,3',
         }
         config = load_multi_job_config(env)
         job = config['jobs'][0]
         self.assertEqual(job['source_custom_format_names'], ['DV', 'HDR'])
         self.assertEqual(job['source_custom_format_exclude_names'], ['SDR fallback'])
+        self.assertEqual(job['source_profile_filters'], ['HD', 'UHD'])
+        self.assertEqual(job['source_profile_filter_ids'], [2, 3])
         self.assertFalse(job['delete_if_filter_not_matching'])
         self.assertFalse(config['reinitialize_b'])
 
@@ -166,12 +211,15 @@ pairs:
     target: target
     interval_seconds: 47
     delete_missing: true
+    source_profile_filters: [HD, UHD]
+    source_profile_filter_ids: [3, 4]
     profile_mappings:
       - source_profile_id: 1
         target_profile_id: 2
     rules:
       - id: quality
         source_quality_match: '^Bluray'
+        source_profile_filter_ids: [5, 6]
       - id: formats
         delete_missing: false
         auto_search: false
@@ -190,6 +238,9 @@ pairs:
         self.assertTrue(quality['delete_missing'])
         self.assertFalse(formats['delete_missing'])
         self.assertFalse(formats['auto_search'])
+        self.assertEqual(quality['source_profile_filters'], ['HD', 'UHD'])
+        self.assertEqual(quality['source_profile_filter_ids'], [5, 6])
+        self.assertEqual(formats['source_profile_filter_ids'], [3, 4])
         self.assertEqual(quality['profile_mappings'][0]['target_profile_id'], 2)
 
     def test_indexed_pair_configuration_matches_yaml_shape(self):
@@ -203,12 +254,15 @@ pairs:
             'SYNCARR_PAIR_1_ID': 'shows', 'SYNCARR_PAIR_1_SOURCE': 'source',
             'SYNCARR_PAIR_1_TARGET': 'target', 'SYNCARR_PAIR_1_INTERVAL_SECONDS': '90',
             'SYNCARR_PAIR_1_DELETE_MISSING': 'true',
+            'SYNCARR_PAIR_1_SOURCE_PROFILE_FILTERS': 'HD,UHD',
+            'SYNCARR_PAIR_1_SOURCE_PROFILE_FILTER_IDS': '3,4',
             'SYNCARR_PAIR_1_PROFILE_MAPPING_COUNT': '1',
             'SYNCARR_PAIR_1_PROFILE_MAPPING_1_SOURCE_PROFILE_ID': '1',
             'SYNCARR_PAIR_1_PROFILE_MAPPING_1_TARGET_PROFILE_ID': '2',
             'SYNCARR_PAIR_1_RULE_COUNT': '2',
             'SYNCARR_PAIR_1_RULE_1_ID': 'filtered',
             'SYNCARR_PAIR_1_RULE_1_SOURCE_QUALITY_MATCH': '^Bluray',
+            'SYNCARR_PAIR_1_RULE_1_SOURCE_PROFILE_FILTER_IDS': '5,6',
             'SYNCARR_PAIR_1_RULE_2_ID': 'remaining',
             'SYNCARR_PAIR_1_RULE_2_DELETE_MISSING': 'false',
         }
@@ -217,6 +271,9 @@ pairs:
         self.assertEqual(config['units'][0]['interval_seconds'], 90)
         self.assertEqual(first['source_quality_match'], '^Bluray')
         self.assertEqual(first['profile_mappings'][0]['source_profile_id'], 1)
+        self.assertEqual(first['source_profile_filters'], ['HD', 'UHD'])
+        self.assertEqual(first['source_profile_filter_ids'], [5, 6])
+        self.assertEqual(second['source_profile_filter_ids'], [3, 4])
         self.assertFalse(second['delete_missing'])
         self.assertTrue(first['delete_missing'])
 

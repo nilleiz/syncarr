@@ -36,6 +36,11 @@ pairs:
     rules:
       - id: bluray
         source_quality_match: '^Bluray'
+        # Optional source-profile allowlist (names or IDs; omit these to match any profile).
+        # source_profile_filters:
+        #   - Source Profile A
+        #   - Source Profile B
+        # source_profile_filter_ids: [1, 2]
       - id: selected_format
         source_custom_format_mode: any
         source_custom_format_names:

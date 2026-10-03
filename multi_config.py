@@ -129,6 +129,8 @@ def _load_environment_config(env):
             'source_profile_id': env.get(prefix + '_SOURCE_PROFILE_ID'),
             'source_profile_filter': env.get(prefix + '_SOURCE_PROFILE_FILTER'),
             'source_profile_filter_id': env.get(prefix + '_SOURCE_PROFILE_FILTER_ID'),
+            'source_profile_filters': env.get(prefix + '_SOURCE_PROFILE_FILTERS'),
+            'source_profile_filter_ids': env.get(prefix + '_SOURCE_PROFILE_FILTER_IDS'),
             'source_quality_match': env.get(prefix + '_SOURCE_QUALITY_MATCH'),
             'source_custom_format_mode': env.get(prefix + '_SOURCE_CUSTOM_FORMAT_MODE'),
             'source_custom_format_names': env.get(prefix + '_SOURCE_CUSTOM_FORMAT_NAMES'),
@@ -206,7 +208,8 @@ def _load_environment_config(env):
 
 
 INDEXED_SETTING_NAMES = (
-    'source_profile_filter', 'source_profile_filter_id', 'source_quality_match',
+    'source_profile_filter', 'source_profile_filter_id', 'source_profile_filters',
+    'source_profile_filter_ids', 'source_quality_match',
     'source_custom_format_mode', 'source_custom_format_names',
     'source_custom_format_exclude_names', 'source_custom_format_minimum_score',
     'source_tag_filter', 'source_tag_filter_id', 'source_blacklist',
@@ -222,7 +225,8 @@ def _read_indexed_settings(env, prefix, raw):
         if env_name not in env:
             continue
         value = env[env_name]
-        if name in ('source_custom_format_names', 'source_custom_format_exclude_names',
+        if name in ('source_profile_filters', 'source_profile_filter_ids',
+                    'source_custom_format_names', 'source_custom_format_exclude_names',
                     'source_tag_filter', 'source_tag_filter_id', 'source_blacklist'):
             value = _string_list(value)
         raw[name] = value
@@ -308,6 +312,9 @@ def _normalize_job(raw, index, instances, global_test_run, allow_profile_mapping
         'source_profile_id': _optional_int(raw.get('source_profile_id'), 'source_profile_id'),
         'source_profile_filter': _optional_text(raw.get('source_profile_filter')),
         'source_profile_filter_id': _optional_int(raw.get('source_profile_filter_id'), 'source_profile_filter_id'),
+        'source_profile_filters': _string_list(raw.get('source_profile_filters')),
+        'source_profile_filter_ids': _int_list(
+            raw.get('source_profile_filter_ids'), 'source_profile_filter_ids'),
         'source_quality_match': _optional_text(raw.get('source_quality_match')),
         'source_custom_format_mode': _optional_lower_text(raw.get('source_custom_format_mode')),
         'source_custom_format_names': _string_list(raw.get('source_custom_format_names')),
@@ -333,6 +340,14 @@ def _normalize_job(raw, index, instances, global_test_run, allow_profile_mapping
         'delete_scope': scope,
         'delete_files': _boolean(raw.get('delete_files', False), 'delete_files'),
     }
+    if ((job['source_profile_filter'] or job['source_profile_filter_id'] is not None) and
+            (job['source_profile_filters'] or job['source_profile_filter_ids'])):
+        raise ConfigurationError(
+            'Job {} cannot combine singular and multiple source profile filters'.format(job_id))
+    if ((job['source_profile_filters'] or job['source_profile_filter_ids']) and
+            source['type'] not in ('radarr', 'sonarr')):
+        raise ConfigurationError(
+            'Job {} multiple source profile filters require Radarr or Sonarr'.format(job_id))
     if (not allow_profile_mapping and job['target_profile'] is None and
             job['target_profile_id'] is None):
         raise ConfigurationError('Job {} needs target_profile or target_profile_id'.format(job_id))
@@ -378,7 +393,8 @@ def _normalize_job(raw, index, instances, global_test_run, allow_profile_mapping
 
 
 PAIR_SETTING_FIELDS = (
-    'source_profile_filter', 'source_profile_filter_id', 'source_quality_match',
+    'source_profile_filter', 'source_profile_filter_id', 'source_profile_filters',
+    'source_profile_filter_ids', 'source_quality_match',
     'source_custom_format_mode', 'source_custom_format_names',
     'source_custom_format_exclude_names', 'source_custom_format_minimum_score',
     'source_tag_filter', 'source_tag_filter_id', 'source_blacklist',
@@ -465,6 +481,14 @@ def _normalize_pair(raw, index, instances, global_test_run):
                 'Pair {} rule {} cannot override pair fields: {}'.format(
                     pair_id, rule_id, ', '.join(sorted(forbidden))))
         effective = dict(common)
+        singular_profile_filter_fields = ('source_profile_filter', 'source_profile_filter_id')
+        plural_profile_filter_fields = ('source_profile_filters', 'source_profile_filter_ids')
+        if set(singular_profile_filter_fields) & set(rule):
+            for field in plural_profile_filter_fields:
+                effective.pop(field, None)
+        if set(plural_profile_filter_fields) & set(rule):
+            for field in singular_profile_filter_fields:
+                effective.pop(field, None)
         effective.update({key: value for key, value in rule.items() if key != 'id'})
         internal_id = 'pair{}_{}_rule{}_{}'.format(
             len(pair_id), pair_id, len(rule_id), rule_id)
