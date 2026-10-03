@@ -31,5 +31,5 @@
 ## Container publishing
 
 - The container workflow builds `linux/amd64` and `linux/arm64`. Pull requests build without publishing; pushes to the default branch publish `latest`, and numeric version tags publish matching tags.
-- GHCR publishing uses the workflow's `GITHUB_TOKEN` with package-write permission. Link images to the source repository with the OCI source label.
+- GHCR packages are set to public after the first publish; public visibility cannot be reverted to private. Publishing uses the workflow's `GITHUB_TOKEN` with package-write permission and links images to the source repository.
 - Keep local `.env` files and private runtime configuration out of Git and Docker build contexts. Compose examples use placeholders and mount runtime configuration read-only.
