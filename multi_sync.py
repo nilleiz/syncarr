@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """Multi-job synchronization engine for Radarr, Sonarr, and Lidarr."""
 
+import json
 import logging
 import re
 import time
@@ -13,6 +14,11 @@ CONTENT_KEYS = {
     'radarr': 'tmdbId',
     'sonarr': 'tvdbId',
     'lidarr': 'foreignArtistId',
+}
+LOG_ID_KEYS = {
+    'radarr': 'tmdb_id',
+    'sonarr': 'tvdb_id',
+    'lidarr': 'foreign_artist_id',
 }
 API_VERSIONS = {'radarr': 'v3', 'sonarr': 'v3', 'lidarr': 'v1'}
 CONTENT_ROUTES = {'radarr': 'movie', 'sonarr': 'series', 'lidarr': 'artist'}
@@ -190,10 +196,38 @@ def _content_key(content, arr_type):
     return str(value) if value is not None else None
 
 
-def _path_for_content(content, job):
+def _log_entity(job, target_client, action, reason, content, entity_side='source',
+                mode=None, level=logging.INFO, **details):
+    """Emit a JSON entity event without serializing config or API payloads."""
+    arr_type = target_client.arr_type
+    content = content if isinstance(content, dict) else {}
+    source = job.get('source') or {}
+    target = job.get('target') or {}
+    external_id = content.get(CONTENT_KEYS[arr_type])
+    record = {
+        'event': 'syncarr.entity',
+        'mode': mode or ('dry_run' if job.get('test_run') else 'live'),
+        'action': action,
+        'reason': reason,
+        'job_id': job.get('id'),
+        'source_instance': job.get('source_instance_id') or source.get('id'),
+        'target_instance': job.get('target_instance_id') or target.get('id'),
+        'arr_type': arr_type,
+        'entity_side': entity_side,
+        'title': content.get('title') or content.get('artistName'),
+        LOG_ID_KEYS[arr_type]: external_id,
+        'arr_record_id': content.get('id'),
+        'has_file': _has_file(content),
+    }
+    record.update(details)
+    LOGGER.log(level, 'ENTITY %s', json.dumps(record, sort_keys=True, ensure_ascii=False))
+
+
+def _path_for_content(content, job, target_client):
     root_path, reason = map_root_path(content.get('path'), job)
     if reason:
-        LOGGER.warning('Job %s skipped an item: %s', job['id'], reason)
+        _log_entity(job, target_client, 'skip', 'root_mapping_failed', content,
+                    mapping_reason=reason, level=logging.WARNING)
     return root_path
 
 
@@ -280,6 +314,15 @@ def _episode_key(external_id, episode):
 
 def _episode_file_id(episode):
     return episode.get('episodeFileId') or (episode.get('episodeFile') or {}).get('id')
+
+
+def _episode_log_fields(episode):
+    return {
+        'episode_id': episode.get('id'),
+        'season_number': episode.get('seasonNumber'),
+        'episode_number': episode.get('episodeNumber'),
+        'episode_file_id': _episode_file_id(episode),
+    }
 
 
 def _source_episodes(client, content, episode_cache):
@@ -385,58 +428,83 @@ def _sync_items(job, source_client, target_client, tag_id, source_items, target_
 
     for content in source_items:
         if not _passes_filters(content, source_client, job, profile_filter_id, tag_filter_ids):
+            _log_entity(job, target_client, 'skip', 'source_filters', content,
+                        level=logging.DEBUG)
             continue
         matching_episodes = None
         if source_client.arr_type == 'radarr' and job['has_file_filters']:
             movie_id = content.get('id')
             files = source_client.list_movie_files(movie_id) if movie_id is not None else []
             if not any(_passes_file_filters(file_record, job) for file_record in files):
+                _log_entity(job, target_client, 'skip', 'source_file_filters', content,
+                            level=logging.DEBUG)
                 continue
         elif source_client.arr_type == 'sonarr' and job['has_file_filters']:
             matching_episodes = _matching_source_episodes(
                 source_client, content, job, episode_cache)
             if not matching_episodes:
+                _log_entity(job, target_client, 'skip', 'source_episode_file_filters', content,
+                            level=logging.DEBUG)
                 continue
         key = _content_key(content, arr_type)
         if key is None:
-            LOGGER.warning('Job %s skipped an item without a stable external ID', job['id'])
+            _log_entity(job, target_client, 'skip', 'missing_external_id', content,
+                        level=logging.WARNING)
             continue
         matches = target_by_key.get(key, [])
         if not matches:
-            root_path = _path_for_content(content, job)
+            root_path = _path_for_content(content, job, target_client)
             if not root_path:
                 continue
             if job['test_run']:
-                LOGGER.info('Job %s would add one item (test run)', job['id'])
+                _log_entity(job, target_client, 'add', 'missing_on_target', content,
+                            outcome='would_apply')
                 continue
             payload = _build_payload(content, job, target_client, root_path, tag_id,
                                      matching_episodes=matching_episodes)
+            _log_entity(job, target_client, 'add', 'missing_on_target', content,
+                        outcome='attempted')
             result = target_client.request('POST', target_client.content_route,
                                            payload=payload, expected=(200, 201))
             if isinstance(result, dict):
                 target_items.append(result)
                 target_by_key.setdefault(key, []).append(result)
-            LOGGER.info('Job %s added one item', job['id'])
             continue
 
         if len(matches) > 1:
-            LOGGER.warning('Job %s found duplicate target IDs; skipped an update', job['id'])
+            _log_entity(job, target_client, 'skip', 'duplicate_target_matches', content,
+                        target_record_ids=[item.get('id') for item in matches],
+                        level=logging.WARNING)
             continue
         current = matches[0]
         current_tags = list(current.get('tags') or [])
         changed = False
+        change_reasons = []
         if tag_id is not None and tag_id not in current_tags:
             current_tags.append(tag_id)
             current['tags'] = current_tags
             changed = True
+            change_reasons.append('managed_tag_missing')
         if (job['sync_monitor'] and not (arr_type == 'sonarr' and job['has_file_filters']) and
                 current.get('monitored') != content.get('monitored')):
             current['monitored'] = content.get('monitored')
             changed = True
-        if changed and not job['test_run']:
-            target_client.request('PUT', '{}/{}'.format(target_client.content_route, current['id']),
-                                  payload=current, expected=(200, 202))
-            LOGGER.info('Job %s updated one item', job['id'])
+            change_reasons.append('monitored_state_differs')
+        if changed:
+            details = {
+                'target_record_id': current.get('id'),
+                'target_has_file': _has_file(current),
+                'change_reasons': change_reasons,
+                'outcome': 'would_apply' if job['test_run'] else 'attempted',
+            }
+            _log_entity(job, target_client, 'update', 'target_state_differs', content,
+                        **details)
+            if not job['test_run']:
+                target_client.request('PUT', '{}/{}'.format(target_client.content_route, current['id']),
+                                      payload=current, expected=(200, 202))
+        else:
+            _log_entity(job, target_client, 'skip', 'target_already_in_sync', content,
+                        target_record_id=current.get('id'), level=logging.DEBUG)
 
 
 def _items_for_deletion(target_items, incoming_jobs, source_snapshots, target_client):
@@ -691,8 +759,64 @@ def _apply_sonarr_episode_plan(plans, current_job, target_client):
         active_authors = set(author['id'] for unused_episode, authors in plan['deletions']
                              for author in authors if not author['test_run'])
         mutating_jobs = set(job['id'] for job in plan['jobs'] if not job['test_run']) | active_authors
-        if current_job['test_run'] or not mutating_jobs:
-            LOGGER.info('Would reconcile Sonarr episode monitoring and file state (test run)')
+        mode = 'live' if not current_job['test_run'] and mutating_jobs else 'dry_run'
+
+        if (plan['series_monitored'] is not None and
+                target_series.get('monitored') != plan['series_monitored']):
+            _log_entity(current_job, target_client, 'update_series_monitoring',
+                        'episode_filter_selection', target_series, entity_side='target',
+                        mode=mode, target_record_id=target_series.get('id'),
+                        monitored=plan['series_monitored'],
+                        outcome='attempted' if mode == 'live' else 'would_apply')
+
+        for episode_id in plan['monitor_true']:
+            episode = episode_by_id.get(episode_id)
+            if episode is not None:
+                _log_entity(current_job, target_client, 'monitor_episode',
+                            'matches_source_file_filters', target_series,
+                            entity_side='target_episode', mode=mode,
+                            has_file=_has_file(episode), **_episode_log_fields(episode),
+                            source_has_file=True,
+                            outcome='attempted' if mode == 'live' else 'would_apply')
+        for episode_id in plan['monitor_false']:
+            episode = episode_by_id.get(episode_id)
+            if episode is not None:
+                _log_entity(current_job, target_client, 'unmonitor_episode',
+                            'source_episode_missing_or_filtered', target_series,
+                            entity_side='target_episode', mode=mode,
+                            has_file=_has_file(episode), **_episode_log_fields(episode),
+                            source_has_file=False,
+                            outcome='attempted' if mode == 'live' else 'would_apply')
+
+        deletion_actions = []
+        for episode, authors in plan['deletions']:
+            if current_job not in authors:
+                continue
+            file_id = _episode_file_id(episode)
+            if not file_id:
+                continue
+            live_authors = [author for author in authors if not author['test_run']]
+            effective_authors = live_authors or authors
+            delete_files = all(author['delete_files'] for author in effective_authors)
+            details = _episode_log_fields(episode)
+            details.update({
+                'target_record_id': target_series.get('id'),
+                'delete_files': delete_files,
+                'author_job_ids': sorted(author['id'] for author in authors),
+                'author_source_instances': sorted(set(
+                    author.get('source_instance_id') or author['source'].get('id')
+                    for author in authors)),
+                'source_has_file': False,
+                'outcome': 'attempted' if mode == 'live' else 'would_apply',
+            })
+            _log_entity(current_job, target_client, 'delete_episode_file',
+                        'source_episode_missing_or_filtered', target_series,
+                        entity_side='target_episode', mode=mode,
+                        has_file=_has_file(episode), **details)
+            if mode == 'live' and current_job in live_authors:
+                deletion_actions.append((file_id, delete_files))
+
+        if mode != 'live':
             continue
 
         if (plan['series_monitored'] is not None and
@@ -704,18 +828,17 @@ def _apply_sonarr_episode_plan(plans, current_job, target_client):
         target_client.set_episodes_monitored(list(plan['monitor_true']), True)
         target_client.set_episodes_monitored(list(plan['monitor_false']), False)
 
-        for episode, authors in plan['deletions']:
-            live_authors = [author for author in authors if not author['test_run']]
-            if not live_authors or current_job not in live_authors:
-                continue
-            file_id = _episode_file_id(episode)
-            if file_id:
-                delete_files = all(author['delete_files'] for author in live_authors)
-                target_client.delete_episode_file(file_id, delete_files)
-                LOGGER.info('Job %s removed a missing Sonarr episode file (delete_files=%s)',
-                            current_job['id'], delete_files)
+        for file_id, delete_files in deletion_actions:
+            target_client.delete_episode_file(file_id, delete_files)
 
         if search_ids and any(job['auto_search'] and not job['test_run'] for job in plan['jobs']):
+            for episode_id in search_ids:
+                episode = episode_by_id[episode_id]
+                _log_entity(current_job, target_client, 'search_episode',
+                            'newly_monitored_source_match', target_series,
+                            entity_side='target_episode', mode='live',
+                            has_file=_has_file(episode), **_episode_log_fields(episode),
+                            source_has_file=True, outcome='attempted')
             target_client.request('POST', 'command',
                                   payload={'name': 'EpisodeSearch', 'episodeIds': search_ids},
                                   expected=(200, 201, 202))
@@ -776,15 +899,24 @@ def run_job(config, job, clients):
 
     candidates = _items_for_deletion(target_items, incoming_jobs, source_snapshots, target_client)
     for item, authors in candidates:
+        if job not in authors:
+            continue
         live_authors = [author for author in authors if not author['test_run']]
+        effective_authors = live_authors or authors
+        delete_files = all(author['delete_files'] for author in effective_authors)
+        _log_entity(job, target_client, 'delete_movie', 'missing_from_source', item,
+                    entity_side='target', target_record_id=item.get('id'),
+                    source_has_file=False, delete_files=delete_files,
+                    author_job_ids=sorted(author['id'] for author in authors),
+                    author_source_instances=sorted(set(
+                        author.get('source_instance_id') or author['source'].get('id')
+                        for author in authors)),
+                    outcome='would_apply' if job['test_run'] else 'attempted')
         if not live_authors:
-            LOGGER.info('Job %s would delete one missing Radarr item (test run)', job['id'])
             continue
         if job not in live_authors:
             continue
-        delete_files = all(author['delete_files'] for author in live_authors)
         target_client.delete_movie(item['id'], delete_files)
-        LOGGER.info('Job %s deleted one missing Radarr item (delete_files=%s)', job['id'], delete_files)
 
 
 def run(config):

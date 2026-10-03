@@ -392,102 +392,43 @@ if instanceB_blacklist:
 def get_path(instance_url, api_path, key, changed_api_version=False):
     global api_version, api_profile_path
 
-    logger.debug(DEBUG_LINE)
-    logger.debug({
-        'instance_url': instance_url,
-        'api_path': api_path,
-        'api_version': api_version,
-        'is_sonarr': is_sonarr,
-        'api_profile_path': api_profile_path,
-        'changed_api_version': changed_api_version,
-    })
-
     url = f"{instance_url}/api/{api_version}{api_path}?apikey={key}"
     return url
 
 
 def get_status_path(instance_url, key, changed_api_version):
     url = get_path(instance_url, api_status_path, key, changed_api_version)
-    logger.debug('get_status_path: {}'.format(url))
     return url
 
 
 def get_content_path(instance_url, key):
     url = get_path(instance_url, api_content_path, key)
-    logger.debug('get_content_path: {}'.format(url))
     return url
 
 def get_content_put_path(instance_url, key, content_id):
     url = get_path(instance_url, f'{api_content_path}/{content_id}', key)
-    logger.debug('get_content_put_path: {}'.format(url))
     return url
 
 
 def get_language_path(instance_url, key):
     url = get_path(instance_url, api_language_path, key)
-    logger.debug('get_language_path: {}'.format(url))
     return url
 
 
 def get_profile_path(instance_url, key):
     url = get_path(instance_url, api_profile_path, key)
-    logger.debug('get_profile_path: {}'.format(url))
     return url
 
 
 def get_tag_path(instance_url, key):
     url = get_path(instance_url, api_tag_path, key)
-    logger.debug('get_tag_path: {}'.format(url))
     return url
 
 ########################################################################################################################
 # check for required fields
 
 
-logger.debug({
-    'instanceA_url': instanceA_url,
-    'instanceA_key': instanceA_key,
-    'instanceA_path': instanceA_path,
-    'instanceA_profile': instanceA_profile,
-    'instanceA_profile_id': instanceA_profile_id,
-    'instanceA_profile_filter': instanceA_profile_filter,
-    'instanceA_profile_filter_id': instanceA_profile_filter_id,
-    'instanceA_language': instanceA_language,
-    'instanceA_language_id': instanceA_language_id,
-    'instanceA_tag_filter': instanceA_tag_filter,
-    'instanceA_tag_filter_id': instanceA_tag_filter_id,
-    'instanceA_quality_match': instanceA_quality_match,
-    'instanceA_blacklist': instanceA_blacklist,
-
-    'instanceB_url': instanceB_url,
-    'instanceB_key': instanceB_key,
-    'instanceB_path': instanceB_path,
-    'instanceB_profile': instanceB_profile,
-    'instanceB_profile_id': instanceB_profile_id,
-    'instanceB_profile_filter': instanceB_profile_filter,
-    'instanceB_profile_filter_id': instanceB_profile_filter_id,
-    'instanceB_language': instanceB_language,
-    'instanceB_language_id': instanceB_language_id,
-    'instanceB_tag_filter': instanceB_tag_filter,
-    'instanceB_tag_filter_id': instanceB_tag_filter_id,
-    'instanceB_quality_match': instanceB_quality_match,
-    'instanceB_blacklist': instanceB_blacklist,
-
-    'api_content_path': api_content_path,
-    'api_profile_path': api_profile_path,
-    'api_language_path': api_language_path,
-
-    'is_sonarr': is_sonarr,
-    'is_lidarr': is_lidarr,
-    'is_radarr': is_radarr,
-
-    'monitor_new_content': monitor_new_content,
-    'sync_bidirectionally': sync_bidirectionally,
-    'auto_search': auto_search,
-    'skip_missing': skip_missing,
-    'api_version': api_version,
-    'sync_monitor': sync_monitor,
-})
+logger.debug('Legacy configuration loaded')
 
 if not instanceA_url:
     logger.error('missing URL for instance A')

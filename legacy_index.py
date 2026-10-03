@@ -30,6 +30,40 @@ from config import (
 )
 
 
+def _legacy_has_file(content):
+    content = content if isinstance(content, dict) else {}
+    file_record = content.get('episodeFile') or content.get('movieFile') or {}
+    return bool(content.get('hasFile') or content.get('episodeFileId') or file_record.get('id'))
+
+
+def _legacy_entity_log(source_name, target_name, action, reason, content,
+                       entity_side='source', level=logging.INFO, **details):
+    content = content if isinstance(content, dict) else {}
+    arr_type = 'radarr' if is_radarr else 'sonarr' if is_sonarr else 'lidarr'
+    external_id_fields = {
+        'tmdbId': 'tmdb_id',
+        'tvdbId': 'tvdb_id',
+        'foreignArtistId': 'foreign_artist_id',
+    }
+    record = {
+        'event': 'syncarr.entity',
+        'mode': 'dry_run' if is_test_run else 'live',
+        'action': action,
+        'reason': reason,
+        'job_id': 'legacy-{}-to-{}'.format(source_name, target_name),
+        'source_instance': source_name,
+        'target_instance': target_name,
+        'arr_type': arr_type,
+        'entity_side': entity_side,
+        'title': content.get('title') or content.get('artistName'),
+        external_id_fields.get(content_id_key, 'external_id'): content.get(content_id_key),
+        'arr_record_id': content.get('id'),
+        'has_file': _legacy_has_file(content),
+    }
+    record.update(details)
+    logger.log(level, 'ENTITY %s', json.dumps(record, sort_keys=True, ensure_ascii=False))
+
+
 def get_content_details(content, instance_path, instance_profile_id, instance_url, instance_language_id=None):
     """gets details of a content item"""
     global monitor_new_content, auto_search
@@ -92,7 +126,6 @@ def get_content_details(content, instance_path, instance_profile_id, instance_ur
             }
         }
 
-    logger.debug(payload)
     return payload
 
 
@@ -100,7 +133,7 @@ def get_quality_profiles(instance_session, instance_url, instance_key):
     instance_profile_url = get_profile_path(instance_url, instance_key)
     profiles_response = instance_session.get(instance_profile_url)
     if profiles_response.status_code != 200:
-        logger.error(f'Could not get profile id from {instance_profile_url}')
+        logger.error('Could not get quality profiles (HTTP %s)', profiles_response.status_code)
         exit_system()
 
     instance_profiles = None
@@ -108,7 +141,7 @@ def get_quality_profiles(instance_session, instance_url, instance_key):
         instance_profiles = profiles_response.json()
         return instance_profiles
     except:
-        logger.error(f'Could not decode profile id from {instance_profile_url}')
+        logger.error('Could not decode quality profile response')
         exit_system()
 
 
@@ -130,14 +163,15 @@ def get_tag_from_id(instance_session, instance_url, instance_key, instance_tag, 
     instance_tag_url = get_tag_path(instance_url, instance_key)
     tag_response = instance_session.get(instance_tag_url)
     if tag_response.status_code != 200:
-        logger.error(f'Could not get tag id from (instance{instance_name}) {instance_tag_url} - only works on Sonarr')
+        logger.error('Could not get tag list for instance %s (HTTP %s)',
+                     instance_name, tag_response.status_code)
         exit_system()
 
     instance_tags = None
     try:
         instance_tags = tag_response.json()
     except:
-        logger.error(f'Could not decode tag id from {instance_tag_url}')
+        logger.error('Could not decode tag list for instance %s', instance_name)
         exit_system()
 
     tag_ids = []
@@ -147,7 +181,7 @@ def get_tag_from_id(instance_session, instance_url, instance_key, instance_tag, 
                 tag_ids.append(item)
 
     if not tag_ids:
-        logger.error(f'Could not find tag_id for instance {instance_name} and tag {instance_tags}')
+        logger.error('Could not resolve configured tags for instance %s', instance_name)
         exit_system()
 
     instance_tag_ids = [tag.get('id') for tag in tag_ids]
@@ -164,14 +198,15 @@ def get_language_from_id(instance_session, instance_url, instance_key, instance_
     instance_language_url = get_language_path(instance_url, instance_key)
     language_response = instance_session.get(instance_language_url)
     if language_response.status_code != 200:
-        logger.error(f'Could not get language id from (instance{instance_name}) {instance_language_url} - only works on sonarr v3')
+        logger.error('Could not get language list for instance %s (HTTP %s)',
+                     instance_name, language_response.status_code)
         exit_system()
 
     instance_languages = None
     try:
         instance_languages = language_response.json()
     except:
-        logger.error(f'Could not decode language id from {instance_language_url}')
+        logger.error('Could not decode language list for instance %s', instance_name)
         exit_system()
 
     instance_languages = instance_languages[0]['languages']
@@ -194,7 +229,8 @@ def get_language_from_id(instance_session, instance_url, instance_key, instance_
 def sync_servers(instanceA_contents, instanceB_language_id, instanceB_contentIds,
                  instanceB_path, instanceB_profile_id, instanceA_profile_filter_id,
                  instanceB_session, instanceB_url, instanceB_key, instanceA_quality_match,
-                 instanceA_tag_filter_id, instanceA_blacklist, instanceB_contents):
+                 instanceA_tag_filter_id, instanceA_blacklist, instanceB_contents,
+                 source_name='A', target_name='B'):
     global is_radarr, is_sonarr, is_test_run, sync_monitor
     search_ids = []
 
@@ -214,40 +250,46 @@ def sync_servers(instanceA_contents, instanceB_language_id, instanceB_contentIds
             if is_radarr and skip_missing:
                 content_has_file = content.get('hasFile')
                 if not content_has_file:
-                    logging.debug(f'Skipping content {title} - file missing')
+                    _legacy_entity_log(source_name, target_name, 'skip', 'source_file_missing',
+                                       content, level=logging.DEBUG)
                     continue
 
             # if given this, we want to filter from instance by profile id
             if instanceA_profile_filter_id:
                 quality_profile_id = content.get('qualityProfileId')
                 if instanceA_profile_filter_id != quality_profile_id:
-                    logging.debug(f'Skipping content {title} - mismatched quality_profile_id {quality_profile_id} with instanceA_profile_filter_id {instanceA_profile_filter_id}')
+                    _legacy_entity_log(source_name, target_name, 'skip', 'source_profile_filter',
+                                       content, level=logging.DEBUG)
                     continue
 
             # if given quality filter we want to filter if quality from instanceA isnt high enough yet
             if is_radarr and instanceA_quality_match:
                 content_quality = content.get('movieFile', {}).get('quality', {}).get('quality', {}).get('name', '')
                 if content_quality and not re.match(instanceA_quality_match, content_quality):
-                    logging.debug(f'Skipping content {title} - mismatched content_quality {content_quality} with instanceA_quality_match {instanceA_quality_match}')
+                    _legacy_entity_log(source_name, target_name, 'skip', 'source_quality_filter',
+                                       content, level=logging.DEBUG)
                     continue
 
             # if given tag filter then filter by tag - (Sonarr/Radarr v3 only)
             if (is_sonarr or is_radarr) and instanceA_tag_filter_id:
                 content_tag_ids = content.get('tags')
                 if not (set(content_tag_ids) & set(instanceA_tag_filter_id)):
-                    logging.debug(f'Skipping content {title} - mismatched content_tag_ids {content_tag_ids} with instanceA_tag_filter_id {instanceA_tag_filter_id}')
+                    _legacy_entity_log(source_name, target_name, 'skip', 'source_tag_filter',
+                                       content, level=logging.DEBUG)
                     continue
 
             # if black list given then dont sync matching slugs/ids
             if instanceA_blacklist:
                 title_slug = content.get('titleSlug') or content.get('foreignArtistId')
                 if title_slug in instanceA_blacklist:
-                    logging.debug(f'Skipping content {title} - blacklist slug: {title_slug}')
+                    _legacy_entity_log(source_name, target_name, 'skip', 'source_blacklist',
+                                       content, level=logging.DEBUG)
                     continue
 
                 content_id = str(content.get('id'))
                 if content_id in instanceA_blacklist:
-                    logging.debug(f'Skipping content {title} - blacklist ID: {content_id}')
+                    _legacy_entity_log(source_name, target_name, 'skip', 'source_blacklist',
+                                       content, level=logging.DEBUG)
                     continue
 
 
@@ -259,23 +301,40 @@ def sync_servers(instanceA_contents, instanceB_language_id, instanceB_contentIds
                 instance_url=instanceB_url,
                 instance_language_id=instanceB_language_id,
             )
-            instanceB_content_url = get_content_path(instanceB_url, instanceB_key)
-
             if is_test_run:
-                logging.info('content title "{0}" synced successfully (test only)'.format(title))
+                if content_not_synced:
+                    _legacy_entity_log(source_name, target_name, 'add', 'missing_on_target',
+                                       content, outcome='would_apply')
+                elif sync_monitor:
+                    matches = [item for item in instanceB_contents
+                               if item.get('titleSlug') == content.get('titleSlug')]
+                    if len(matches) == 1 and matches[0].get('monitored') != content.get('monitored'):
+                        _legacy_entity_log(
+                            source_name, target_name, 'update', 'monitored_state_differs', content,
+                            target_record_id=matches[0].get('id'),
+                            target_has_file=_legacy_has_file(matches[0]),
+                            monitored=content.get('monitored'), outcome='would_apply')
+                    else:
+                        _legacy_entity_log(source_name, target_name, 'skip',
+                                           'target_monitor_state_matches' if len(matches) == 1 else
+                                           'target_match_not_unique', content,
+                                           target_record_ids=[item.get('id') for item in matches],
+                                           level=logging.DEBUG)
             elif content_not_synced:
                 # sync content if not synced
-                logging.info(f'syncing content title "{title}"')
+                _legacy_entity_log(source_name, target_name, 'add', 'missing_on_target',
+                                   content, outcome='attempted')
+                instanceB_content_url = get_content_path(instanceB_url, instanceB_key)
                 sync_response = instanceB_session.post(instanceB_content_url, json=formatted_content)
                 # check response and save content id for searching later on if success
                 if sync_response.status_code != 201 and sync_response.status_code != 200:
-                    logger.error(f'server sync error for {title} - response: {sync_response.text}')
+                    logger.error('Server sync failed for %s (HTTP %s)', title,
+                                 sync_response.status_code)
                 else:
                     try:
                         search_ids.append(int(sync_response.json()['id']))
-                    except:
-                        logger.error(f'Could not decode sync response from {instanceB_content_url}')
-                    logging.info('content title "{0}" synced successfully'.format(title))
+                    except (KeyError, TypeError, ValueError):
+                        logger.error('Could not decode sync response for %s', title)
 
             elif sync_monitor:
                 # else if is already synced and we want to sync monitoring then sync that now
@@ -286,18 +345,37 @@ def sync_servers(instanceA_contents, instanceB_language_id, instanceB_contentIds
                     matching_content_instanceB = matching_content_instanceB[0]
                     # if we found a content match from instance B, then check monitored status - if different then sync from A to B
                     if matching_content_instanceB['monitored'] != content['monitored']:
+                        _legacy_entity_log(
+                            source_name, target_name, 'update', 'monitored_state_differs', content,
+                            target_record_id=matching_content_instanceB.get('id'),
+                            target_has_file=_legacy_has_file(matching_content_instanceB),
+                            monitored=content.get('monitored'), outcome='attempted')
                         matching_content_instanceB['monitored'] = content['monitored']
                         instanceB_content_url = get_content_put_path(instanceB_url, instanceB_key, matching_content_instanceB.get('id'))
                         sync_response = instanceB_session.put(instanceB_content_url, json=matching_content_instanceB)
                         # check response and save content id for searching later on if success
                         if sync_response.status_code != 202:
-                            logger.error(f'server monitoring sync error for {title} - response: {sync_response.text}')
+                            logger.error('Server monitoring sync failed for %s (HTTP %s)',
+                                         title, sync_response.status_code)
                         else:
                             try:
                                 search_ids.append(int(sync_response.json()['id']))
-                            except:
-                                logger.error(f'Could not decode sync response from {instanceB_content_url}')
-                            logging.info('content title "{0}" monitoring synced successfully'.format(title))
+                            except (KeyError, TypeError, ValueError):
+                                logger.error('Could not decode monitoring response for %s', title)
+                    else:
+                        _legacy_entity_log(source_name, target_name, 'skip',
+                                           'target_monitor_state_matches', content,
+                                           target_record_id=matching_content_instanceB.get('id'),
+                                           level=logging.DEBUG)
+                else:
+                    _legacy_entity_log(source_name, target_name, 'skip',
+                                       'target_match_not_unique', content,
+                                       target_record_ids=[item.get('id')
+                                                          for item in matching_content_instanceB],
+                                       level=logging.WARNING)
+        else:
+            _legacy_entity_log(source_name, target_name, 'skip', 'already_on_target', content,
+                               level=logging.DEBUG)
 
     logging.info(f'{len(search_ids)} contents synced successfully')
 
@@ -314,7 +392,7 @@ def get_instance_contents(instance_url, instance_key, instance_session, instance
         try:
             instance_contents = instance_contents.json()
         except:
-            logger.error(f'Could not decode contents from {instance_content_url}')
+            logger.error('Could not decode content list for instance %s', instance_name)
             exit_system()
 
     for content_to_sync in instance_contents:
@@ -328,7 +406,7 @@ def check_status(instance_session, instance_url, instance_key, instance_name='')
     global api_version
 
     instance_status_url = get_status_path(instance_url, instance_key)
-    error_message = f'Could not connect to instance{instance_name}: {instance_status_url}'
+    error_message = f'Could not connect to instance{instance_name}'
     status_response = None
 
     try:
@@ -348,15 +426,16 @@ def check_status(instance_session, instance_url, instance_key, instance_name='')
             status_response = status_response.json()
         except Exception as error:
             if not isinstance(status_response, dict):
-                logger.error(
-                    f"Could not retrieve status for {instance_status_url}: {status_response} - {error}")
+                logger.error('Could not retrieve status for instance%s (%s)',
+                             instance_name, error.__class__.__name__)
                 exit_system()
 
         if(status_response.get('error')):
-            logger.error(f"{instance_status_url} error {status_response.get('error')}")
+            logger.error('Status request failed for instance%s', instance_name)
             exit_system()
 
-        logger.debug(f"{instance_status_url} version {status_response.get('version')}")
+        logger.debug('Retrieved status for instance%s (version %s)',
+                     instance_name, status_response.get('version'))
 
     return status_response
 
@@ -453,7 +532,9 @@ def sync_content():
         instanceB_key=instanceB_key,
         instanceA_quality_match=instanceA_quality_match,
         instanceA_tag_filter_id=instanceA_tag_filter_id,
-        instanceA_blacklist=instanceA_blacklist
+        instanceA_blacklist=instanceA_blacklist,
+        source_name='A',
+        target_name='B'
     )
 
     # if given bidirectional flag then sync from instance B to instance A
@@ -473,7 +554,9 @@ def sync_content():
             instanceB_key=instanceA_key,
             instanceA_quality_match=instanceB_quality_match,
             instanceA_tag_filter_id=instanceB_tag_filter_id,
-            instanceA_blacklist=instanceB_blacklist
+            instanceA_blacklist=instanceB_blacklist,
+            source_name='B',
+            target_name='A'
         )
 
 ########################################################################################################################
