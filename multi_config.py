@@ -19,14 +19,16 @@ CUSTOM_FORMAT_MODES = ('any', 'all', 'score')
 
 def multi_job_mode_requested(environ=None):
     env = os.environ if environ is None else environ
-    return bool(env.get('SYNCARR_CONFIG') or env.get('SYNCARR_JOB_COUNT') or env.get('SYNCARR_INSTANCE_COUNT'))
+    return bool(env.get('SYNCARR_CONFIG') or env.get('SYNCARR_JOB_COUNT') or
+                env.get('SYNCARR_PAIR_COUNT') or env.get('SYNCARR_INSTANCE_COUNT'))
 
 
 def load_multi_job_config(environ=None):
     """Return normalized config, or None when legacy mode should be used."""
     env = os.environ if environ is None else environ
     config_path = env.get('SYNCARR_CONFIG')
-    has_indexed_config = bool(env.get('SYNCARR_JOB_COUNT') or env.get('SYNCARR_INSTANCE_COUNT'))
+    has_indexed_config = bool(env.get('SYNCARR_JOB_COUNT') or env.get('SYNCARR_PAIR_COUNT') or
+                              env.get('SYNCARR_INSTANCE_COUNT'))
 
     if config_path and has_indexed_config:
         raise ConfigurationError('Set either SYNCARR_CONFIG or indexed SYNCARR_INSTANCE/JOB variables, not both')
@@ -55,11 +57,14 @@ def _load_yaml_config(path, env):
         raise ConfigurationError('The YAML configuration must be a mapping')
 
     raw_instances = data.get('instances')
-    raw_jobs = data.get('jobs')
+    raw_jobs = data.get('jobs', [])
+    raw_pairs = data.get('pairs', [])
     if not isinstance(raw_instances, dict) or not raw_instances:
         raise ConfigurationError('The YAML configuration needs an instances mapping')
-    if not isinstance(raw_jobs, list) or not raw_jobs:
-        raise ConfigurationError('The YAML configuration needs a non-empty jobs list')
+    if not isinstance(raw_jobs, list) or not isinstance(raw_pairs, list):
+        raise ConfigurationError('The YAML jobs and pairs settings must be lists')
+    if not raw_jobs and not raw_pairs:
+        raise ConfigurationError('The YAML configuration needs at least one job or pair')
 
     instances = {}
     for instance_id, raw in raw_instances.items():
@@ -83,12 +88,17 @@ def _load_yaml_config(path, env):
         data.get('reinitialize_b', env.get('SYNCARR_REINITIALIZE_B', '0')), 'reinitialize_b')
     jobs = [_normalize_job(raw, index, instances, global_test_run)
             for index, raw in enumerate(raw_jobs, start=1)]
-    return _finish_config(instances, jobs, global_test_run, reinitialize_b)
+    pairs = [_normalize_pair(raw, index, instances, global_test_run)
+             for index, raw in enumerate(raw_pairs, start=1)]
+    return _finish_config(instances, jobs, global_test_run, reinitialize_b, pairs)
 
 
 def _load_environment_config(env):
     instance_count = _integer(env.get('SYNCARR_INSTANCE_COUNT'), 'SYNCARR_INSTANCE_COUNT', minimum=1)
-    job_count = _integer(env.get('SYNCARR_JOB_COUNT'), 'SYNCARR_JOB_COUNT', minimum=1)
+    job_count = _integer(env.get('SYNCARR_JOB_COUNT', '0'), 'SYNCARR_JOB_COUNT', minimum=0)
+    pair_count = _integer(env.get('SYNCARR_PAIR_COUNT', '0'), 'SYNCARR_PAIR_COUNT', minimum=0)
+    if not job_count and not pair_count:
+        raise ConfigurationError('Set SYNCARR_JOB_COUNT or SYNCARR_PAIR_COUNT to at least one')
     instances = {}
     for index in range(1, instance_count + 1):
         prefix = 'SYNCARR_INSTANCE_{}'.format(index)
@@ -152,7 +162,84 @@ def _load_environment_config(env):
         raw['root_mappings'] = mappings
         jobs.append(_normalize_job(raw, index, instances, global_test_run))
 
-    return _finish_config(instances, jobs, global_test_run, reinitialize_b)
+    pairs = []
+    for index in range(1, pair_count + 1):
+        prefix = 'SYNCARR_PAIR_{}'.format(index)
+        pair_id = _required(env, prefix + '_ID')
+        source_id = _required(env, prefix + '_SOURCE')
+        target_id = _required(env, prefix + '_TARGET')
+        raw_pair = {
+            'id': pair_id,
+            'source': source_id,
+            'target': target_id,
+            'interval_seconds': env.get(prefix + '_INTERVAL_SECONDS', 300),
+        }
+        _read_indexed_settings(env, prefix, raw_pair)
+        _read_indexed_mappings(env, prefix, raw_pair)
+        profile_count = _integer(env.get(prefix + '_PROFILE_MAPPING_COUNT', '0'),
+                                 prefix + '_PROFILE_MAPPING_COUNT', minimum=0)
+        profile_mappings = []
+        for mapping_index in range(1, profile_count + 1):
+            mapping_prefix = '{}_PROFILE_MAPPING_{}'.format(prefix, mapping_index)
+            profile_mappings.append({
+                'source_profile': env.get(mapping_prefix + '_SOURCE_PROFILE'),
+                'source_profile_id': env.get(mapping_prefix + '_SOURCE_PROFILE_ID'),
+                'target_profile': env.get(mapping_prefix + '_TARGET_PROFILE'),
+                'target_profile_id': env.get(mapping_prefix + '_TARGET_PROFILE_ID'),
+            })
+        raw_pair['profile_mappings'] = profile_mappings
+        rule_count = _integer(env.get(prefix + '_RULE_COUNT', '0'),
+                              prefix + '_RULE_COUNT', minimum=0)
+        if rule_count < 1:
+            raise ConfigurationError('{} needs at least one rule'.format(prefix))
+        rules = []
+        for rule_index in range(1, rule_count + 1):
+            rule_prefix = '{}_RULE_{}'.format(prefix, rule_index)
+            rule = {'id': _required(env, rule_prefix + '_ID')}
+            _read_indexed_settings(env, rule_prefix, rule)
+            _read_indexed_mappings(env, rule_prefix, rule)
+            rules.append(rule)
+        raw_pair['rules'] = rules
+        pairs.append(_normalize_pair(raw_pair, index, instances, global_test_run))
+
+    return _finish_config(instances, jobs, global_test_run, reinitialize_b, pairs)
+
+
+INDEXED_SETTING_NAMES = (
+    'source_profile_filter', 'source_profile_filter_id', 'source_quality_match',
+    'source_custom_format_mode', 'source_custom_format_names',
+    'source_custom_format_exclude_names', 'source_custom_format_minimum_score',
+    'source_tag_filter', 'source_tag_filter_id', 'source_blacklist',
+    'target_root_path', 'auto_search', 'skip_missing', 'monitor_new_content',
+    'sync_monitor', 'test_run', 'delete_missing', 'delete_if_filter_not_matching',
+    'delete_scope', 'delete_files',
+)
+
+
+def _read_indexed_settings(env, prefix, raw):
+    for name in INDEXED_SETTING_NAMES:
+        env_name = '{}_{}'.format(prefix, name.upper())
+        if env_name not in env:
+            continue
+        value = env[env_name]
+        if name in ('source_custom_format_names', 'source_custom_format_exclude_names',
+                    'source_tag_filter', 'source_tag_filter_id', 'source_blacklist'):
+            value = _string_list(value)
+        raw[name] = value
+
+
+def _read_indexed_mappings(env, prefix, raw):
+    count = _integer(env.get(prefix + '_ROOT_MAPPING_COUNT', '0'),
+                     prefix + '_ROOT_MAPPING_COUNT', minimum=0)
+    mappings = []
+    for index in range(1, count + 1):
+        mapping_prefix = '{}_ROOT_MAPPING_{}'.format(prefix, index)
+        mappings.append({
+            'source': _required(env, mapping_prefix + '_SOURCE'),
+            'target': _required(env, mapping_prefix + '_TARGET'),
+        })
+    if count or prefix + '_ROOT_MAPPING_COUNT' in env:
+        raw['root_mappings'] = mappings
 
 
 def _normalize_instance(instance_id, arr_type, url, api_key, conflict_policy=None):
@@ -175,7 +262,7 @@ def _normalize_instance(instance_id, arr_type, url, api_key, conflict_policy=Non
     }
 
 
-def _normalize_job(raw, index, instances, global_test_run):
+def _normalize_job(raw, index, instances, global_test_run, allow_profile_mapping=False):
     if not isinstance(raw, dict):
         raise ConfigurationError('Job {} must be a mapping'.format(index))
     job_id = str(raw.get('id') or '').strip().lower()
@@ -246,7 +333,8 @@ def _normalize_job(raw, index, instances, global_test_run):
         'delete_scope': scope,
         'delete_files': _boolean(raw.get('delete_files', False), 'delete_files'),
     }
-    if job['target_profile'] is None and job['target_profile_id'] is None:
+    if (not allow_profile_mapping and job['target_profile'] is None and
+            job['target_profile_id'] is None):
         raise ConfigurationError('Job {} needs target_profile or target_profile_id'.format(job_id))
     if job['delete_if_filter_not_matching'] and source['type'] != 'radarr':
         raise ConfigurationError(
@@ -289,12 +377,146 @@ def _normalize_job(raw, index, instances, global_test_run):
     return job
 
 
-def _finish_config(instances, jobs, test_run, reinitialize_b=False):
+PAIR_SETTING_FIELDS = (
+    'source_profile_filter', 'source_profile_filter_id', 'source_quality_match',
+    'source_custom_format_mode', 'source_custom_format_names',
+    'source_custom_format_exclude_names', 'source_custom_format_minimum_score',
+    'source_tag_filter', 'source_tag_filter_id', 'source_blacklist',
+    'target_root_path', 'root_mappings', 'auto_search', 'skip_missing',
+    'monitor_new_content', 'sync_monitor', 'test_run', 'delete_missing',
+    'delete_if_filter_not_matching', 'delete_scope', 'delete_files',
+)
+
+
+def _normalize_profile_mappings(raw_mappings, pair_id):
+    if not isinstance(raw_mappings, list) or not raw_mappings:
+        raise ConfigurationError('Pair {} needs a non-empty profile_mappings list'.format(pair_id))
+    mappings = []
+    source_selectors = set()
+    for index, mapping in enumerate(raw_mappings, start=1):
+        if not isinstance(mapping, dict):
+            raise ConfigurationError('Pair {} profile mapping {} must be a mapping'.format(pair_id, index))
+        source_name = _optional_text(mapping.get('source_profile'))
+        source_id = _optional_int(mapping.get('source_profile_id'), 'source_profile_id')
+        target_name = _optional_text(mapping.get('target_profile'))
+        target_id = _optional_int(mapping.get('target_profile_id'), 'target_profile_id')
+        if (source_name is None) == (source_id is None):
+            raise ConfigurationError(
+                'Pair {} profile mapping {} needs exactly one source profile name or ID'.format(pair_id, index))
+        if (target_name is None) == (target_id is None):
+            raise ConfigurationError(
+                'Pair {} profile mapping {} needs exactly one target profile name or ID'.format(pair_id, index))
+        selector = ('id', source_id) if source_id is not None else ('name', source_name.casefold())
+        if selector in source_selectors:
+            raise ConfigurationError('Pair {} maps one source profile more than once'.format(pair_id))
+        source_selectors.add(selector)
+        mappings.append({
+            'source_profile': source_name,
+            'source_profile_id': source_id,
+            'target_profile': target_name,
+            'target_profile_id': target_id,
+        })
+    return mappings
+
+
+def _normalize_pair(raw, index, instances, global_test_run):
+    if not isinstance(raw, dict):
+        raise ConfigurationError('Pair {} must be a mapping'.format(index))
+    pair_id = str(raw.get('id') or '').strip().lower()
+    if not re.match(r'^[A-Za-z0-9][A-Za-z0-9_-]*$', pair_id):
+        raise ConfigurationError('Pair {} needs a stable id using letters, digits, _ or -'.format(index))
+    source_id = str(raw.get('source') or '').strip()
+    target_id = str(raw.get('target') or '').strip()
+    if source_id not in instances or target_id not in instances:
+        raise ConfigurationError('Pair {} references an unknown source or target instance'.format(pair_id))
+    source = instances[source_id]
+    target = instances[target_id]
+    if source['identity'] == target['identity']:
+        raise ConfigurationError('Pair {} source and target must be different instances'.format(pair_id))
+    if source['type'] != target['type']:
+        raise ConfigurationError('Pair {} source and target must use the same *arr type'.format(pair_id))
+    if source['type'] not in ('radarr', 'sonarr'):
+        raise ConfigurationError('Pair {} supports Radarr and Sonarr only'.format(pair_id))
+
+    profile_mappings = _normalize_profile_mappings(raw.get('profile_mappings'), pair_id)
+    interval = _integer(raw.get('interval_seconds', 300),
+                        'pair {} interval_seconds'.format(pair_id), minimum=1)
+    raw_rules = raw.get('rules')
+    if not isinstance(raw_rules, list) or not raw_rules:
+        raise ConfigurationError('Pair {} needs a non-empty rules list'.format(pair_id))
+
+    common = {name: raw[name] for name in PAIR_SETTING_FIELDS if name in raw}
+    jobs = []
+    rule_ids = set()
+    for rule_index, rule in enumerate(raw_rules, start=1):
+        if not isinstance(rule, dict):
+            raise ConfigurationError('Pair {} rule {} must be a mapping'.format(pair_id, rule_index))
+        rule_id = str(rule.get('id') or '').strip().lower()
+        if not re.match(r'^[A-Za-z0-9][A-Za-z0-9_-]*$', rule_id):
+            raise ConfigurationError(
+                'Pair {} rule {} needs a stable id using letters, digits, _ or -'.format(pair_id, rule_index))
+        if rule_id in rule_ids:
+            raise ConfigurationError('Pair {} rule ids must be unique'.format(pair_id))
+        rule_ids.add(rule_id)
+        forbidden = {'source', 'target', 'interval_seconds', 'profile_mappings',
+                     'target_profile', 'target_profile_id'} & set(rule)
+        if forbidden:
+            raise ConfigurationError(
+                'Pair {} rule {} cannot override pair fields: {}'.format(
+                    pair_id, rule_id, ', '.join(sorted(forbidden))))
+        effective = dict(common)
+        effective.update({key: value for key, value in rule.items() if key != 'id'})
+        internal_id = 'pair{}_{}_rule{}_{}'.format(
+            len(pair_id), pair_id, len(rule_id), rule_id)
+        effective.update({
+            'id': internal_id,
+            'source': source_id,
+            'target': target_id,
+            'interval_seconds': interval,
+        })
+        job = _normalize_job(effective, rule_index, instances, global_test_run,
+                             allow_profile_mapping=True)
+        job.update({
+            'pair_id': pair_id,
+            'rule_id': rule_id,
+            'profile_mappings': profile_mappings,
+            'is_pair_rule': True,
+        })
+        jobs.append(job)
+    return {
+        'id': pair_id,
+        'source_instance_id': source_id,
+        'target_instance_id': target_id,
+        'source': source,
+        'target': target,
+        'interval_seconds': interval,
+        'profile_mappings': profile_mappings,
+        'jobs': jobs,
+    }
+
+
+def _finish_config(instances, jobs, test_run, reinitialize_b=False, pairs=None):
+    pairs = [] if pairs is None else pairs
     ids = [job['id'] for job in jobs]
     if len(ids) != len(set(ids)):
         raise ConfigurationError('Job ids must be unique')
-    if not jobs:
-        raise ConfigurationError('At least one job is required')
+    if not jobs and not pairs:
+        raise ConfigurationError('At least one job or pair is required')
+    pair_ids = [pair['id'] for pair in pairs]
+    if len(pair_ids) != len(set(pair_ids)):
+        raise ConfigurationError('Pair ids must be unique')
+    all_jobs = list(jobs)
+    units = []
+    for job in jobs:
+        units.append({'kind': 'job', 'id': job['id'], 'key': 'job:{}'.format(job['id']),
+                      'interval_seconds': job['interval_seconds'], 'jobs': [job]})
+    for pair in pairs:
+        all_jobs.extend(pair['jobs'])
+        units.append({'kind': 'pair', 'id': pair['id'], 'key': 'pair:{}'.format(pair['id']),
+                      'interval_seconds': pair['interval_seconds'], 'jobs': pair['jobs']})
+    ids = [job['id'] for job in all_jobs]
+    if len(ids) != len(set(ids)):
+        raise ConfigurationError('Job and pair rule identifiers must be unique')
     policies_by_target = {}
     for instance in instances.values():
         identity = (instance['type'], instance['url'])
@@ -306,6 +528,9 @@ def _finish_config(instances, jobs, test_run, reinitialize_b=False):
     return {
         'instances': instances,
         'jobs': jobs,
+        'all_jobs': all_jobs,
+        'pairs': pairs,
+        'units': units,
         'test_run': test_run,
         'reinitialize_b': reinitialize_b,
     }

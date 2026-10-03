@@ -1,57 +1,46 @@
 # Copy this file to a private config location and mount it into the container.
 # Put endpoint URLs and API keys in environment variables; never add keys here.
 test_run: true
-# Optional one-time run: execute every job once, then stay idle until the container is stopped.
+# Optional one-time run: execute every configured unit once, then stay idle.
 reinitialize_b: false
 
 instances:
-  source_a:
+  movie_source:
     type: radarr
-    url_env: RADARR_A_URL
-    api_key_env: RADARR_A_KEY
-  source_b:
-    type: radarr
-    url_env: RADARR_B_URL
-    api_key_env: RADARR_B_KEY
-  target:
+    url_env: RADARR_SOURCE_URL
+    api_key_env: RADARR_SOURCE_KEY
+  movie_target:
     type: radarr
     url_env: RADARR_TARGET_URL
     api_key_env: RADARR_TARGET_KEY
     delete_conflict_policy: keep_if_any_source
 
-jobs:
-  - id: movies_a
-    source: source_a
-    target: target
+# A pair owns one interval and a set of transfer rules.
+pairs:
+  - id: movies
+    source: movie_source
+    target: movie_target
     interval_seconds: 300
-    target_profile: HD
-    # Optional source file filters (Radarr and Sonarr multi-job mode):
-    # source_quality_match: '^Bluray-2160p$'
-    # source_custom_format_mode: any
-    # source_custom_format_names:
-    #   - Dolby Vision without fallback
-    # source_custom_format_exclude_names:
-    #   - HDR10 fallback
-    # Radarr only: with delete_missing enabled, allow filter-mismatching files to count as missing.
-    # delete_if_filter_not_matching: false
-    skip_missing: true
-    auto_search: true
-    monitor_new_content: true
-    root_mappings:
-      - source: /source-a/movies
-        target: /target/movies
-      - source: /source-a/documentaries
-        target: /target/documentaries
-    delete_missing: true
-    delete_scope: managed_only
-    delete_files: false
 
-  - id: movies_b
-    source: source_b
-    target: target
-    interval_seconds: 600
-    target_profile: HD
-    target_root_path: /target/movies
-    delete_missing: true
-    delete_scope: managed_only
-    delete_files: false
+    # Match the existing source and target profile names on these instances.
+    profile_mappings:
+      - source_profile: Source HD
+        target_profile: Target HD
+      - source_profile: Source 4K
+        target_profile: Target 4K
+
+    root_mappings:
+      - source: /source/movies
+        target: /target/movies
+
+    rules:
+      - id: bluray
+        source_quality_match: '^Bluray'
+      - id: selected_format
+        source_custom_format_mode: any
+        source_custom_format_names:
+          - Example Format
+
+    # Deletion remains opt-in. Rules may override shared settings:
+    # delete_missing: true
+    # delete_files: false
