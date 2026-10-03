@@ -27,6 +27,18 @@ Start from [`syncarr.example.yml`](syncarr.example.yml). Set `SYNCARR_CONFIG` to
 
 The sample starts in `test_run` mode. Review the rules and logs, then set `test_run: false` when ready. Each job runs immediately and then follows its own `interval_seconds` value.
 
+### Entity action logs
+
+Both modes write one JSON record per planned or attempted add or update. Multi-job mode also logs delete, monitor, unmonitor, and episode-search actions. Entity log messages are prefixed with `ENTITY ` and contain `event: "syncarr.entity"`, `mode`, `action`, `reason`, `job_id`, source and target instance IDs, `arr_type`, `title`, a type-specific ID (`tmdb_id`, `tvdb_id`, or `foreign_artist_id`), `entity_side`, and `has_file`. Sonarr episode records also include season, episode, episode-file, and series IDs. Multi-job delete records include `delete_files` and the authorizing job IDs. `dry_run` records use `outcome: "would_apply"`; live records use `outcome: "attempted"`. Dry-run and live deletion records carry the same entity and decision fields, including `delete_files`.
+
+Example (formatted here for readability; logs contain one JSON object per line):
+
+```json
+{"event":"syncarr.entity","mode":"dry_run","action":"delete_movie","reason":"missing_from_source","job_id":"movies","source_instance":"radarr-a","target_instance":"radarr-b","arr_type":"radarr","entity_side":"target","title":"Example Movie","tmdb_id":12345,"arr_record_id":42,"has_file":true,"source_has_file":false,"delete_files":false,"outcome":"would_apply"}
+```
+
+Filter skips and already-synced items are available at `DEBUG` level. Logs use instance IDs and selected entity fields; they do not serialize endpoint URLs, API keys, request headers, or API payloads.
+
 `root_mappings` maps a source library root to a target library root. The longest matching source prefix is selected, with a directory boundary check. An item whose path matches none of a job's configured mappings is skipped and logged. With no mappings, `target_root_path` is used; if that is also absent, Syncarr uses the item's parent directory as the legacy fallback.
 
 For several sources sharing one target, `keep_if_any_source` is the default conflict policy: an item is retained while any configured source still contains it. For Radarr deletion, a source movie counts as present only when its record has `hasFile: true`. This presence check ignores quality-profile and `source_quality_match` filters, so a file on any source protects the target. `source_rule_wins` is available when each rule should make its own deletion decision.

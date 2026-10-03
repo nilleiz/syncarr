@@ -21,6 +21,7 @@
 - Sonarr file-filter jobs add a series only when at least one source episode file matches. Fileless and nonmatching episodes remain unmonitored. Episode matching uses season and episode numbers; newly monitored matching episodes are searched when `auto_search` is enabled.
 - Multi-job mode does not expose the legacy Sonarr language-profile setting; use file-level custom-format filters when matching those formats.
 - `test_run` may be set globally or per job. A test run performs read-only planning and does not add, update, tag, or delete content.
+- Entity actions use `ENTITY`-prefixed JSON records with title, stable Arr ID, instance IDs, action, reason, and file state. Multi-job dry-run and live deletion records share the same decision fields. Serialize only allow-listed metadata; never log endpoint URLs, API keys, headers, or request payloads.
 
 ## Change hygiene
 

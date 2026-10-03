@@ -1,3 +1,4 @@
+import json
 import unittest
 
 from unittest.mock import patch
@@ -51,6 +52,7 @@ class FakeRadarrClient(object):
     def __init__(self, identity, items=None, error=None):
         self.identity = identity
         self.arr_type = 'radarr'
+        self.content_route = 'movie'
         self.url = identity[1]
         self.items = list(items or [])
         self.error = error
@@ -97,6 +99,8 @@ def _episode(number, file_id, monitored, quality, formats=None, score=0):
 def _job(job_id, source, target, tag_id, **changes):
     job = {
         'id': job_id,
+        'source_instance_id': source.identity[1].rsplit('/', 1)[-1],
+        'target_instance_id': target.identity[1].rsplit('/', 1)[-1],
         'source': {'identity': source.identity},
         'target': {
             'identity': target.identity,
@@ -109,6 +113,8 @@ def _job(job_id, source, target, tag_id, **changes):
         'source_tag_filter_id': [],
         'source_tag_filter': [],
         'source_blacklist': [],
+        'target_profile': None,
+        'target_profile_id': None,
         'source_quality_match': '^Bluray',
         'source_custom_format_mode': 'any',
         'source_custom_format_names': ['Dolby Vision without fallback'],
@@ -126,6 +132,12 @@ def _job(job_id, source, target, tag_id, **changes):
     job.update(changes)
     target.tag_ids[rule_tag(job)] = tag_id
     return job
+
+
+def _entity_events(captured):
+    return [json.loads(record.getMessage()[len('ENTITY '):])
+            for record in captured.records
+            if record.getMessage().startswith('ENTITY ')]
 
 
 class FileFilterTests(unittest.TestCase):
@@ -271,6 +283,123 @@ class RadarrDeletionPresenceTests(unittest.TestCase):
         self.assertEqual(target.deleted_movies, [])
 
 
+class EntityLoggingTests(unittest.TestCase):
+    def test_add_events_identify_movie_in_dry_run_and_live_without_secrets(self):
+        source_item = {
+            'id': 10, 'tmdbId': 100, 'title': 'Example Movie',
+            'path': '/source/movies/Example Movie', 'hasFile': True,
+        }
+        records = []
+        for test_run in (True, False):
+            source = FakeRadarrClient(('radarr', 'https://source.invalid'), [source_item])
+            target = FakeRadarrClient(('radarr', 'https://target.invalid'))
+            job = _job('movies', source, target, 7,
+                       test_run=test_run, has_file_filters=False,
+                       source_quality_match=None, source_custom_format_mode=None,
+                       root_mappings=[], target_root_path='/target/movies',
+                       resolved_profile_id=1)
+            job['source']['api_key'] = 'source-secret'
+            job['target']['api_key'] = 'target-secret'
+            job['target']['url'] = 'https://user:target-secret@target.invalid'
+            with self.assertLogs('syncarr', level='INFO') as captured:
+                _sync_items(job, source, target, 7, [source_item], [])
+            event = next(item for item in _entity_events(captured) if item['action'] == 'add')
+            records.append(event)
+
+        for event in records:
+            self.assertEqual(event['title'], 'Example Movie')
+            self.assertEqual(event['tmdb_id'], 100)
+            self.assertEqual(event['source_instance'], 'source.invalid')
+            self.assertEqual(event['target_instance'], 'target.invalid')
+            self.assertTrue(event['has_file'])
+        self.assertEqual(records[0]['mode'], 'dry_run')
+        self.assertEqual(records[1]['mode'], 'live')
+        self.assertEqual(records[0]['outcome'], 'would_apply')
+        self.assertEqual(records[1]['outcome'], 'attempted')
+        comparable = [dict(event, mode=None, outcome=None) for event in records]
+        self.assertEqual(comparable[0], comparable[1])
+        self.assertNotIn('source-secret', str(records))
+        self.assertNotIn('target-secret', str(records))
+        self.assertNotIn('https://', str(records))
+
+    def test_update_events_include_target_identity_and_change_reason(self):
+        records = []
+        for test_run in (True, False):
+            source = FakeRadarrClient(('radarr', 'http://source'), [{
+                'id': 10, 'tmdbId': 100, 'title': 'Existing Movie',
+                'hasFile': True, 'monitored': False,
+            }])
+            target = FakeRadarrClient(('radarr', 'http://target'))
+            job = _job('movies', source, target, 7,
+                       test_run=test_run, has_file_filters=False,
+                       source_quality_match=None, sync_monitor=True)
+            target_item = {
+                'id': 20, 'tmdbId': 100, 'title': 'Existing Movie',
+                'hasFile': True, 'monitored': True, 'tags': [],
+            }
+            with self.assertLogs('syncarr', level='INFO') as captured:
+                _sync_items(job, source, target, 7, source.items, [target_item])
+            event = next(item for item in _entity_events(captured)
+                         if item['action'] == 'update')
+            records.append(event)
+
+        for event in records:
+            self.assertEqual(event['title'], 'Existing Movie')
+            self.assertEqual(event['tmdb_id'], 100)
+            self.assertEqual(event['arr_record_id'], 10)
+            self.assertEqual(event['target_record_id'], 20)
+            self.assertTrue(event['has_file'])
+            self.assertTrue(event['target_has_file'])
+            self.assertEqual(event['change_reasons'],
+                             ['managed_tag_missing', 'monitored_state_differs'])
+        self.assertEqual(records[0]['mode'], 'dry_run')
+        self.assertEqual(records[1]['mode'], 'live')
+        self.assertEqual(dict(records[0], mode=None, outcome=None),
+                         dict(records[1], mode=None, outcome=None))
+
+    def test_radarr_dry_run_delete_logs_same_details_as_live_delete(self):
+        records = []
+        targets = []
+        for test_run in (True, False):
+            source = FakeRadarrClient(('radarr', 'http://source'))
+            target_item = {
+                'id': 20, 'tmdbId': 100, 'title': 'Missing Movie',
+                'hasFile': True, 'tags': [7],
+            }
+            target = FakeRadarrClient(('radarr', 'http://target'), [target_item])
+            job = _job('delete', source, target, 7,
+                       delete_missing=True, delete_scope='all_missing',
+                       delete_files=True, has_file_filters=False,
+                       source_quality_match=None, test_run=test_run)
+            config = {'jobs': [job]}
+            clients = {source.identity: source, target.identity: target}
+            with self.assertLogs('syncarr', level='INFO') as captured:
+                run_job(config, job, clients)
+            event = next(item for item in _entity_events(captured)
+                         if item['action'] == 'delete_movie')
+            records.append(event)
+            targets.append(target)
+
+        dry_run, live = records
+        for event in records:
+            self.assertEqual(event['title'], 'Missing Movie')
+            self.assertEqual(event['tmdb_id'], 100)
+            self.assertEqual(event['arr_record_id'], 20)
+            self.assertEqual(event['target_record_id'], 20)
+            self.assertTrue(event['has_file'])
+            self.assertFalse(event['source_has_file'])
+            self.assertTrue(event['delete_files'])
+            self.assertEqual(event['author_job_ids'], ['delete'])
+        self.assertEqual(dry_run['mode'], 'dry_run')
+        self.assertEqual(live['mode'], 'live')
+        self.assertEqual(dry_run['outcome'], 'would_apply')
+        self.assertEqual(live['outcome'], 'attempted')
+        self.assertEqual(dict(dry_run, mode=None, outcome=None),
+                         dict(live, mode=None, outcome=None))
+        self.assertEqual(targets[0].deleted_movies, [])
+        self.assertEqual(targets[1].deleted_movies, [(20, True)])
+
+
 class SonarrEpisodePlanTests(unittest.TestCase):
     def make_fixture(self, second_source=False):
         target_identity = ('sonarr', 'http://target')
@@ -361,6 +490,39 @@ class SonarrEpisodePlanTests(unittest.TestCase):
         job['test_run'] = True
         _apply_sonarr_episode_plan(plans, job, target)
         self.assertEqual(target.calls, [])
+
+    def test_sonarr_episode_delete_dry_run_has_same_details_as_live(self):
+        records = []
+        targets = []
+        for test_run in (True, False):
+            target, unused_source, job, clients, snapshots, target_items = self.make_fixture()
+            target_items[0]['title'] = 'Example Series'
+            job['test_run'] = test_run
+            plans = _sonarr_episode_plan([job], clients, target, target_items, snapshots, {})
+            with self.assertLogs('syncarr', level='INFO') as captured:
+                _apply_sonarr_episode_plan(plans, job, target)
+            event = next(item for item in _entity_events(captured)
+                         if item['action'] == 'delete_episode_file')
+            records.append(event)
+            targets.append(target)
+
+        dry_run, live = records
+        for event in records:
+            self.assertEqual(event['title'], 'Example Series')
+            self.assertEqual(event['tvdb_id'], 100)
+            self.assertEqual(event['episode_id'], 52)
+            self.assertEqual(event['season_number'], 1)
+            self.assertEqual(event['episode_number'], 2)
+            self.assertEqual(event['episode_file_id'], 500)
+            self.assertTrue(event['has_file'])
+            self.assertFalse(event['source_has_file'])
+            self.assertTrue(event['delete_files'])
+        self.assertEqual(dry_run['mode'], 'dry_run')
+        self.assertEqual(live['mode'], 'live')
+        self.assertEqual(dict(dry_run, mode=None, outcome=None),
+                         dict(live, mode=None, outcome=None))
+        self.assertFalse(any(call[0] == 'DELETE_FILE' for call in targets[0].calls))
+        self.assertIn(('DELETE_FILE', 500, True), targets[1].calls)
 
     def test_filtered_series_is_added_only_for_matching_episode_files(self):
         source = FakeSonarrClient(('sonarr', 'http://source'), {
