@@ -23,6 +23,13 @@ jobs:
     target: target
     interval_seconds: 300
     target_profile: HD
+    # Optional source file filters (Radarr and Sonarr multi-job mode):
+    # source_quality_match: '^Bluray-2160p$'
+    # source_custom_format_mode: any
+    # source_custom_format_names:
+    #   - Dolby Vision without fallback
+    # source_custom_format_exclude_names:
+    #   - HDR10 fallback
     skip_missing: true
     auto_search: true
     monitor_new_content: true

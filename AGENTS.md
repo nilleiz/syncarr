@@ -6,7 +6,7 @@
 - The legacy configuration remains in `config.py` and `config.conf`.
 - The multi-job configuration loader is `multi_config.py`; synchronization and scheduling are in `multi_sync.py`.
 - The Docker image currently uses Python 3.6. Keep new code compatible with Python 3.6 unless the image runtime is deliberately upgraded.
-- The multi-job mode uses YAML through PyYAML. Endpoint URLs and API keys are supplied through environment variables, not embedded in example configuration files.
+- The multi-job mode uses YAML through PyYAML. Endpoint URLs and API keys are supplied through environment variables, not embedded in example configuration files or logs.
 
 ## Multi-job configuration decisions
 
@@ -15,15 +15,12 @@
 - A single target may receive content from multiple source instances. The default `keep_if_any_source` delete conflict policy protects an item while any configured source still contains it. `source_rule_wins` is an explicit alternative that evaluates each delete-enabled rule independently.
 - Aliases for the same *arr endpoint must use one API key and one destination conflict policy.
 - The `managed_only` deletion scope is the default. Syncarr assigns target tags named `syncarr-<job-id>` to content it manages. Older untagged target items are not eligible under this scope unless manually tagged. `all_missing` is an explicit scope that does not require a Syncarr tag.
-- Missing-content deletion is opt-in, supported for Radarr jobs, and uses Radarr's `DELETE /api/v3/movie/{id}` endpoint. `delete_files` defaults to false. For a shared target, media files are removed only when every rule authorizing the deletion enables `delete_files`.
+- Missing-content deletion is opt-in. Radarr jobs delete missing movies. Sonarr jobs can remove target episode-file entries when a source episode loses its file or no longer matches an enabled filter, then unmonitor that episode. `delete_files` defaults to false; shared media is removed only when every live rule authorizing deletion enables it.
 - Deletion is skipped for a destination when any configured source inventory needed for its conflict policy cannot be read.
+- Optional multi-job file filters are `source_quality_match` and custom-format modes `any`, `all`, or `score`. Quality and custom-format checks are combined on the same source file. Sonarr evaluates episode files individually; only matching episodes are monitored. Multiple jobs targeting one Sonarr series combine matching episodes as a union. Unfiltered jobs retain their prior monitoring behavior.
+- Sonarr file-filter jobs add a series only when at least one source episode file matches. Fileless and nonmatching episodes remain unmonitored. Episode matching uses season and episode numbers; newly monitored matching episodes are searched when `auto_search` is enabled.
+- Multi-job mode does not expose the legacy Sonarr language-profile setting; use file-level custom-format filters when matching those formats.
 - `test_run` may be set globally or per job. A test run performs read-only planning and does not add, update, tag, or delete content.
-
-## *arr API notes
-
-- Radarr and Sonarr use API v3 routes; Lidarr uses API v1 routes in this codebase.
-- The external IDs used for matching are `tmdbId` (Radarr), `tvdbId` (Sonarr), and `foreignArtistId` (Lidarr).
-- API keys are sent in the `X-Api-Key` request header by the multi-job engine and must not be written to logs, documentation, or committed configuration.
 
 ## Change hygiene
 

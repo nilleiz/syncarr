@@ -34,7 +34,6 @@ class ArrClient(object):
         self.session.headers.update({'X-Api-Key': instance['api_key']})
         self._profiles = None
         self._tags = None
-        self._languages = None
 
     @property
     def identity(self):
@@ -100,24 +99,31 @@ class ArrClient(object):
             return self.tag_id(label, create=False)
         return item.get('id') if item else None
 
-    def language_profile_id(self, name, explicit_id):
-        if explicit_id is not None:
-            return explicit_id
-        if not name:
-            return None
-        if self.arr_type != 'sonarr':
-            raise SyncError('Language profiles can only be resolved for Sonarr')
-        if self._languages is None:
-            self._languages = self.request('GET', 'languageprofile', expected=(200,))
-        match = next((profile for profile in self._languages
-                      if str(profile.get('name', '')).lower() == name.lower()), None)
-        if match is None:
-            match = next((profile for profile in self._languages
-                          if any(str(item.get('language', {}).get('name', '')).lower() == name.lower()
-                                 for item in profile.get('languages', []))), None)
-        if match is None:
-            raise SyncError('Could not resolve target language on the configured Sonarr instance')
-        return match.get('id')
+    def list_movie_files(self, movie_id):
+        result = self.request('GET', 'moviefile', params={'movieId': movie_id}, expected=(200,))
+        if not isinstance(result, list):
+            raise SyncError('Radarr movie-file response was not a list')
+        return result
+
+    def list_episodes(self, series_id):
+        result = self.request('GET', 'episode',
+                              params={'seriesId': series_id, 'includeEpisodeFile': 'true'},
+                              expected=(200,))
+        if not isinstance(result, list):
+            raise SyncError('Sonarr episode response was not a list')
+        return result
+
+    def set_episodes_monitored(self, episode_ids, monitored):
+        if not episode_ids:
+            return
+        self.request('PUT', 'episode/monitor',
+                     payload={'episodeIds': list(episode_ids), 'monitored': bool(monitored)},
+                     expected=(200, 202))
+
+    def delete_episode_file(self, file_id, delete_files):
+        self.request('DELETE', 'episodefile/{}'.format(file_id),
+                     params={'deleteFiles': 'true' if delete_files else 'false'},
+                     expected=(200, 202, 204))
 
     def delete_movie(self, content_id, delete_files):
         self.request('DELETE', 'movie/{}'.format(content_id),
@@ -211,12 +217,6 @@ def _passes_filters(content, client, job, profile_filter_id, tag_filter_ids):
         return False
     if tag_filter_ids and not (set(content.get('tags') or []) & tag_filter_ids):
         return False
-    if job['source_quality_match']:
-        movie_file = content.get('movieFile') or {}
-        quality = movie_file.get('quality') or {}
-        quality_name = (quality.get('quality') or {}).get('name', '')
-        if quality_name and not re.match(job['source_quality_match'], quality_name):
-            return False
     blacklist = set(job['source_blacklist'])
     if blacklist:
         slug = content.get('titleSlug') or content.get('foreignArtistId')
@@ -225,6 +225,78 @@ def _passes_filters(content, client, job, profile_filter_id, tag_filter_ids):
     if client.arr_type == 'radarr' and job['skip_missing'] and not content.get('hasFile'):
         return False
     return True
+
+
+def _has_file(record):
+    if not isinstance(record, dict):
+        return False
+    file_record = record.get('episodeFile') or record.get('movieFile') or {}
+    return bool(record.get('hasFile') or record.get('episodeFileId') or file_record.get('id'))
+
+
+def _passes_file_filters(file_record, job):
+    if not job['has_file_filters']:
+        return True
+    if not isinstance(file_record, dict):
+        return False
+
+    quality_match = job['source_quality_match']
+    if quality_match:
+        quality = file_record.get('quality') or {}
+        quality_name = (quality.get('quality') or {}).get('name')
+        if not quality_name or not re.match(quality_match, str(quality_name)):
+            return False
+
+    mode = job['source_custom_format_mode']
+    if mode == 'score':
+        try:
+            score = int(file_record.get('customFormatScore'))
+        except (TypeError, ValueError):
+            return False
+        if score < job['source_custom_format_minimum_score']:
+            return False
+    elif mode in ('any', 'all'):
+        formats = file_record.get('customFormats') or []
+        names = {str(item.get('name', '')).casefold() for item in formats if isinstance(item, dict)}
+        required = {name.casefold() for name in job['source_custom_format_names']}
+        excluded = {name.casefold() for name in job['source_custom_format_exclude_names']}
+        if names & excluded:
+            return False
+        if mode == 'any' and not (names & required):
+            return False
+        if mode == 'all' and not required.issubset(names):
+            return False
+    return True
+
+
+def _episode_key(external_id, episode):
+    try:
+        season_number = int(episode.get('seasonNumber'))
+        episode_number = int(episode.get('episodeNumber'))
+    except (TypeError, ValueError):
+        return None
+    return str(external_id), season_number, episode_number
+
+
+def _episode_file_id(episode):
+    return episode.get('episodeFileId') or (episode.get('episodeFile') or {}).get('id')
+
+
+def _source_episodes(client, content, episode_cache):
+    series_id = content.get('id')
+    if series_id is None:
+        return []
+    cache_key = (client.identity, str(series_id))
+    if cache_key not in episode_cache:
+        episode_cache[cache_key] = client.list_episodes(series_id)
+    return episode_cache[cache_key]
+
+
+def _matching_source_episodes(client, content, job, episode_cache):
+    episodes = _source_episodes(client, content, episode_cache)
+    return [episode for episode in episodes
+            if _has_file(episode) and
+            _passes_file_filters(episode.get('episodeFile'), job)]
 
 
 def _image_payload(content, target_url):
@@ -238,7 +310,7 @@ def _image_payload(content, target_url):
     return images
 
 
-def _build_payload(content, job, client, root_path, tag_id):
+def _build_payload(content, job, client, root_path, tag_id, matching_episodes=None):
     target = job['target']
     profile_id = job['resolved_profile_id']
     monitored = job['monitor_new_content'] if job['monitor_new_content'] is not None else content.get('monitored', True)
@@ -260,18 +332,27 @@ def _build_payload(content, job, client, root_path, tag_id):
             'addOptions': dict(add_options, searchForMovie=job['auto_search']),
         })
     elif target['type'] == 'sonarr':
+        search_missing = job['auto_search']
+        seasons = content.get('seasons')
+        if job['has_file_filters']:
+            # Let episode-level reconciliation decide what Sonarr monitors and searches.
+            # A series-level add search here could grab episodes that failed the file filter.
+            search_missing = False
+            monitored = bool(matching_episodes)
+            seasons = [dict(season, monitored=False) for season in (seasons or [])]
         payload.update({
             'title': content.get('title'),
             'titleSlug': content.get('titleSlug'),
-            'seasons': content.get('seasons'),
+            'seasons': seasons,
             'year': content.get('year'),
             'tvRageId': content.get('tvRageId'),
             'seasonFolder': content.get('seasonFolder'),
-            'languageProfileId': job.get('resolved_language_profile_id') or content.get('languageProfileId'),
             'seriesType': content.get('seriesType'),
             'useSceneNumbering': content.get('useSceneNumbering'),
-            'addOptions': dict(add_options, searchForMissingEpisodes=job['auto_search']),
+            'addOptions': dict(add_options, searchForMissingEpisodes=search_missing),
         })
+        if job['has_file_filters']:
+            payload['monitored'] = monitored
     else:
         payload.update({
             'artistName': content.get('artistName'),
@@ -288,13 +369,12 @@ def _prepare_job(job, clients, create_tags):
     target_client = clients[job['target']['identity']]
     job['resolved_profile_id'] = target_client.profile_id(
         job['target_profile'], job['target_profile_id'], 'target profile')
-    job['resolved_language_profile_id'] = target_client.language_profile_id(
-        job['target_language'], job['target_language_id'])
     tag_id = target_client.tag_id(rule_tag(job), create=create_tags)
     return source_client, target_client, tag_id
 
 
-def _sync_items(job, source_client, target_client, tag_id, source_items, target_items):
+def _sync_items(job, source_client, target_client, tag_id, source_items, target_items, episode_cache=None):
+    episode_cache = {} if episode_cache is None else episode_cache
     profile_filter_id, tag_filter_ids = _resolve_source_filters(source_client, job)
     arr_type = source_client.arr_type
     target_by_key = {}
@@ -306,6 +386,17 @@ def _sync_items(job, source_client, target_client, tag_id, source_items, target_
     for content in source_items:
         if not _passes_filters(content, source_client, job, profile_filter_id, tag_filter_ids):
             continue
+        matching_episodes = None
+        if source_client.arr_type == 'radarr' and job['has_file_filters']:
+            movie_id = content.get('id')
+            files = source_client.list_movie_files(movie_id) if movie_id is not None else []
+            if not any(_passes_file_filters(file_record, job) for file_record in files):
+                continue
+        elif source_client.arr_type == 'sonarr' and job['has_file_filters']:
+            matching_episodes = _matching_source_episodes(
+                source_client, content, job, episode_cache)
+            if not matching_episodes:
+                continue
         key = _content_key(content, arr_type)
         if key is None:
             LOGGER.warning('Job %s skipped an item without a stable external ID', job['id'])
@@ -318,7 +409,8 @@ def _sync_items(job, source_client, target_client, tag_id, source_items, target_
             if job['test_run']:
                 LOGGER.info('Job %s would add one item (test run)', job['id'])
                 continue
-            payload = _build_payload(content, job, target_client, root_path, tag_id)
+            payload = _build_payload(content, job, target_client, root_path, tag_id,
+                                     matching_episodes=matching_episodes)
             result = target_client.request('POST', target_client.content_route,
                                            payload=payload, expected=(200, 201))
             if isinstance(result, dict):
@@ -337,7 +429,8 @@ def _sync_items(job, source_client, target_client, tag_id, source_items, target_
             current_tags.append(tag_id)
             current['tags'] = current_tags
             changed = True
-        if job['sync_monitor'] and current.get('monitored') != content.get('monitored'):
+        if (job['sync_monitor'] and not (arr_type == 'sonarr' and job['has_file_filters']) and
+                current.get('monitored') != content.get('monitored')):
             current['monitored'] = content.get('monitored')
             changed = True
         if changed and not job['test_run']:
@@ -395,11 +488,262 @@ def _target_group(config, target_identity):
     return [job for job in config['jobs'] if job['target']['identity'] == target_identity]
 
 
+def _series_episode_keys(external_id, episodes, job):
+    keys = set()
+    for episode in episodes:
+        if not _has_file(episode):
+            continue
+        if job['has_file_filters'] and not _passes_file_filters(episode.get('episodeFile'), job):
+            continue
+        key = _episode_key(external_id, episode)
+        if key is not None:
+            keys.add(key)
+    return keys
+
+
+def _sonarr_episode_plan(incoming_jobs, clients, target_client, target_items,
+                         source_snapshots, episode_cache):
+    """Build all Sonarr monitor and file-deletion actions before performing writes."""
+    target_by_key = {}
+    for item in target_items:
+        key = _content_key(item, 'sonarr')
+        if key is not None:
+            target_by_key.setdefault(key, []).append(item)
+
+    tag_ids = {}
+    resolved_filters = {}
+    source_content_by_job = {}
+    for job in incoming_jobs:
+        source_client = clients[job['source']['identity']]
+        resolved_filters[job['id']] = _resolve_source_filters(source_client, job)
+        contents = source_snapshots[job['source']['identity']]
+        content_by_key = {}
+        for content in contents:
+            key = _content_key(content, 'sonarr')
+            if key is not None:
+                content_by_key.setdefault(key, content)
+        source_content_by_job[job['id']] = content_by_key
+        tag_ids[job['id']] = target_client.tag_id(rule_tag(job), create=False)
+
+    source_keys_by_job = dict((job['id'], set()) for job in incoming_jobs)
+    deleting_jobs = [job for job in incoming_jobs if job['delete_missing']]
+    all_missing_deletion = any(job['delete_scope'] == 'all_missing' for job in deleting_jobs)
+    plans = []
+    duplicate_target_keys = {key for key, items in target_by_key.items() if len(items) > 1}
+
+    for external_id, target_matches in target_by_key.items():
+        if external_id in duplicate_target_keys:
+            LOGGER.warning('Sonarr episode reconciliation skipped a duplicate target series ID')
+            continue
+        target_series = target_matches[0]
+        target_tags = set(target_series.get('tags') or [])
+        applicable_filter_jobs = []
+        unfiltered_applicable = False
+        desired_source_keys = set()
+        auto_search_source_keys = set()
+
+        for job in incoming_jobs:
+            source_client = clients[job['source']['identity']]
+            content = source_content_by_job[job['id']].get(external_id)
+            profile_filter_id, tag_filter_ids = resolved_filters[job['id']]
+            passes = bool(content and _passes_filters(
+                content, source_client, job, profile_filter_id, tag_filter_ids))
+            tagged = (tag_ids[job['id']] is not None and tag_ids[job['id']] in target_tags)
+
+            if content is not None and passes:
+                source_episodes = _source_episodes(source_client, content, episode_cache)
+                source_keys_by_job[job['id']].update(
+                    _series_episode_keys(external_id, source_episodes, job))
+            else:
+                source_episodes = []
+
+            if job['has_file_filters'] or job['delete_missing']:
+                # A previously managed series stays in this rule's episode set even if
+                # its source series disappeared or stopped passing a series-level filter.
+                if (passes or tagged) and not job['test_run']:
+                    applicable_filter_jobs.append(job)
+                    if passes:
+                        matched = _series_episode_keys(external_id, source_episodes, job)
+                        desired_source_keys.update(matched)
+                        if job['auto_search']:
+                            auto_search_source_keys.update(matched)
+            elif passes and not job['test_run']:
+                # Preserve the existing whole-series monitoring behavior for an
+                # overlapping job that does not participate in episode filtering.
+                unfiltered_applicable = True
+
+        if not applicable_filter_jobs and not all_missing_deletion:
+            continue
+
+        target_episodes = target_client.list_episodes(target_series.get('id'))
+        target_by_episode_key = {}
+        for episode in target_episodes:
+            key = _episode_key(external_id, episode)
+            if key is not None:
+                target_by_episode_key[key] = episode
+
+        selected_ids = set()
+        newly_monitored_ids = set()
+        unmonitored_ids = set()
+        for key, episode in target_by_episode_key.items():
+            selected = key in desired_source_keys
+            episode_id = episode.get('id')
+            if episode_id is None:
+                continue
+            if selected:
+                selected_ids.add(episode_id)
+                if not episode.get('monitored', False):
+                    newly_monitored_ids.add(episode_id)
+            elif applicable_filter_jobs and not unfiltered_applicable and episode.get('monitored', False):
+                unmonitored_ids.add(episode_id)
+
+        series_monitored = None
+        if applicable_filter_jobs and not unfiltered_applicable:
+            series_monitored = bool(selected_ids)
+        elif selected_ids and not target_series.get('monitored', False):
+            series_monitored = True
+
+        deletions = []
+        if deleting_jobs:
+            policy = deleting_jobs[0]['target']['delete_conflict_policy']
+            any_source_episode_keys = set().union(*source_keys_by_job.values()) if source_keys_by_job else set()
+            target_files = {}
+            episode_authors = {}
+            for key, episode in target_by_episode_key.items():
+                if not _has_file(episode):
+                    continue
+                file_id = _episode_file_id(episode)
+                if file_id:
+                    target_files.setdefault(file_id, []).append((key, episode))
+                authors = []
+                if policy == 'keep_if_any_source':
+                    if key in any_source_episode_keys:
+                        continue
+                    for author in deleting_jobs:
+                        tag_id = tag_ids[author['id']]
+                        if author['delete_scope'] == 'all_missing' or (
+                                tag_id is not None and tag_id in target_tags):
+                            authors.append(author)
+                else:
+                    for author in deleting_jobs:
+                        tag_id = tag_ids[author['id']]
+                        if key in source_keys_by_job[author['id']]:
+                            continue
+                        if author['delete_scope'] == 'all_missing' or (
+                                tag_id is not None and tag_id in target_tags):
+                            authors.append(author)
+                if authors:
+                    episode_authors[key] = authors
+
+            # A Sonarr file may cover multiple episodes. Delete it only when every
+            # episode attached to that file is eligible and shares an authorizing rule.
+            jobs_by_id = {job['id']: job for job in deleting_jobs}
+            for file_id, file_episodes in target_files.items():
+                author_sets = []
+                for episode_key, unused_episode in file_episodes:
+                    authors = episode_authors.get(episode_key)
+                    if not authors:
+                        author_sets = []
+                        break
+                    author_sets.append(set(author['id'] for author in authors))
+                if not author_sets:
+                    continue
+                common_author_ids = set.intersection(*author_sets)
+                if common_author_ids:
+                    representative = file_episodes[0][1]
+                    deletions.append((representative,
+                                      [jobs_by_id[author_id] for author_id in common_author_ids]))
+
+        if applicable_filter_jobs or deletions:
+            plans.append({
+                'series': target_series,
+                'episodes': target_episodes,
+                'monitor_true': selected_ids,
+                'monitor_false': unmonitored_ids,
+                'newly_monitored': newly_monitored_ids & selected_ids,
+                'auto_search_keys': auto_search_source_keys,
+                'series_monitored': series_monitored,
+                'deletions': deletions,
+                'jobs': applicable_filter_jobs,
+            })
+
+    return plans
+
+
+def _apply_sonarr_episode_plan(plans, current_job, target_client):
+    for plan in plans:
+        target_series = plan['series']
+        episode_by_id = {episode.get('id'): episode for episode in plan['episodes']}
+        new_ids = plan['newly_monitored']
+        search_ids = [episode_id for episode_id in new_ids
+                      if _episode_key(_content_key(target_series, 'sonarr'), episode_by_id[episode_id])
+                      in plan['auto_search_keys'] and not _has_file(episode_by_id[episode_id])]
+
+        active_authors = set(author['id'] for unused_episode, authors in plan['deletions']
+                             for author in authors if not author['test_run'])
+        mutating_jobs = set(job['id'] for job in plan['jobs'] if not job['test_run']) | active_authors
+        if current_job['test_run'] or not mutating_jobs:
+            LOGGER.info('Would reconcile Sonarr episode monitoring and file state (test run)')
+            continue
+
+        if (plan['series_monitored'] is not None and
+                target_series.get('monitored') != plan['series_monitored']):
+            target_series['monitored'] = plan['series_monitored']
+            target_client.request('PUT', 'series/{}'.format(target_series['id']),
+                                  payload=target_series, expected=(200, 202))
+
+        target_client.set_episodes_monitored(list(plan['monitor_true']), True)
+        target_client.set_episodes_monitored(list(plan['monitor_false']), False)
+
+        for episode, authors in plan['deletions']:
+            live_authors = [author for author in authors if not author['test_run']]
+            if not live_authors or current_job not in live_authors:
+                continue
+            file_id = _episode_file_id(episode)
+            if file_id:
+                delete_files = all(author['delete_files'] for author in live_authors)
+                target_client.delete_episode_file(file_id, delete_files)
+                LOGGER.info('Job %s removed a missing Sonarr episode file (delete_files=%s)',
+                            current_job['id'], delete_files)
+
+        if search_ids and any(job['auto_search'] and not job['test_run'] for job in plan['jobs']):
+            target_client.request('POST', 'command',
+                                  payload={'name': 'EpisodeSearch', 'episodeIds': search_ids},
+                                  expected=(200, 201, 202))
+
+
 def run_job(config, job, clients):
     source_client, target_client, tag_id = _prepare_job(job, clients, create_tags=not job['test_run'])
     source_items = source_client.list_content()
     target_items = target_client.list_content()
-    _sync_items(job, source_client, target_client, tag_id, source_items, target_items)
+    episode_cache = {}
+    _sync_items(job, source_client, target_client, tag_id, source_items, target_items,
+                episode_cache=episode_cache)
+
+    if target_client.arr_type == 'sonarr':
+        incoming_jobs = _target_group(config, target_client.identity)
+        if any(incoming_job['has_file_filters'] or incoming_job['delete_missing']
+               for incoming_job in incoming_jobs):
+            source_snapshots = {}
+            try:
+                for incoming_job in incoming_jobs:
+                    source_identity = incoming_job['source']['identity']
+                    if source_identity not in source_snapshots:
+                        incoming_client = clients[source_identity]
+                        contents = (source_items if incoming_client.identity == source_client.identity
+                                    else incoming_client.list_content())
+                        source_snapshots[source_identity] = contents
+                # The just-added series and its episode IDs must be visible before we
+                # reconcile individual episode monitoring and file deletion.
+                target_items = target_client.list_content()
+                plans = _sonarr_episode_plan(incoming_jobs, clients, target_client,
+                                             target_items, source_snapshots, episode_cache)
+            except SyncError as error:
+                LOGGER.error('Job %s will not reconcile Sonarr episode state because an inventory failed (%s)',
+                             job['id'], error)
+                return
+            _apply_sonarr_episode_plan(plans, job, target_client)
+        return
 
     if not job['delete_missing']:
         return

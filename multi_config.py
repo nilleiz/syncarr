@@ -14,6 +14,7 @@ class ConfigurationError(ValueError):
 SUPPORTED_TYPES = ('radarr', 'sonarr', 'lidarr')
 CONFLICT_POLICIES = ('keep_if_any_source', 'source_rule_wins')
 DELETE_SCOPES = ('managed_only', 'all_missing')
+CUSTOM_FORMAT_MODES = ('any', 'all', 'score')
 
 
 def multi_job_mode_requested(environ=None):
@@ -99,6 +100,9 @@ def _load_environment_config(env):
     jobs = []
     for index in range(1, job_count + 1):
         prefix = 'SYNCARR_JOB_{}'.format(index)
+        if env.get(prefix + '_TARGET_LANGUAGE') or env.get(prefix + '_TARGET_LANGUAGE_ID'):
+            raise ConfigurationError(
+                '{} target language settings are legacy Sonarr v3 only'.format(prefix))
         raw = {
             'id': _required(env, prefix + '_ID'),
             'source': _required(env, prefix + '_SOURCE'),
@@ -109,13 +113,15 @@ def _load_environment_config(env):
             'source_profile_filter': env.get(prefix + '_SOURCE_PROFILE_FILTER'),
             'source_profile_filter_id': env.get(prefix + '_SOURCE_PROFILE_FILTER_ID'),
             'source_quality_match': env.get(prefix + '_SOURCE_QUALITY_MATCH'),
+            'source_custom_format_mode': env.get(prefix + '_SOURCE_CUSTOM_FORMAT_MODE'),
+            'source_custom_format_names': env.get(prefix + '_SOURCE_CUSTOM_FORMAT_NAMES'),
+            'source_custom_format_exclude_names': env.get(prefix + '_SOURCE_CUSTOM_FORMAT_EXCLUDE_NAMES'),
+            'source_custom_format_minimum_score': env.get(prefix + '_SOURCE_CUSTOM_FORMAT_MINIMUM_SCORE'),
             'source_tag_filter': env.get(prefix + '_SOURCE_TAG_FILTER'),
             'source_tag_filter_id': env.get(prefix + '_SOURCE_TAG_FILTER_ID'),
             'source_blacklist': env.get(prefix + '_SOURCE_BLACKLIST'),
             'target_profile': env.get(prefix + '_TARGET_PROFILE'),
             'target_profile_id': env.get(prefix + '_TARGET_PROFILE_ID'),
-            'target_language': env.get(prefix + '_TARGET_LANGUAGE'),
-            'target_language_id': env.get(prefix + '_TARGET_LANGUAGE_ID'),
             'target_root_path': env.get(prefix + '_TARGET_ROOT_PATH'),
             'auto_search': env.get(prefix + '_AUTO_SEARCH', '1'),
             'skip_missing': env.get(prefix + '_SKIP_MISSING', '1'),
@@ -193,8 +199,8 @@ def _normalize_job(raw, index, instances, global_test_run):
     scope = str(raw.get('delete_scope') or 'managed_only').strip().lower()
     if scope not in DELETE_SCOPES:
         raise ConfigurationError('Job {} has an invalid delete_scope'.format(job_id))
-    if source['type'] != 'radarr' and _boolean(raw.get('delete_missing', False), 'delete_missing'):
-        raise ConfigurationError('Deletion is currently supported for Radarr jobs only')
+    if source['type'] == 'lidarr' and _boolean(raw.get('delete_missing', False), 'delete_missing'):
+        raise ConfigurationError('Deletion is currently supported for Radarr and Sonarr jobs only')
 
     job = {
         'id': job_id,
@@ -208,13 +214,17 @@ def _normalize_job(raw, index, instances, global_test_run):
         'source_profile_filter': _optional_text(raw.get('source_profile_filter')),
         'source_profile_filter_id': _optional_int(raw.get('source_profile_filter_id'), 'source_profile_filter_id'),
         'source_quality_match': _optional_text(raw.get('source_quality_match')),
+        'source_custom_format_mode': _optional_lower_text(raw.get('source_custom_format_mode')),
+        'source_custom_format_names': _string_list(raw.get('source_custom_format_names')),
+        'source_custom_format_exclude_names': _string_list(raw.get('source_custom_format_exclude_names')),
+        'source_custom_format_minimum_score': _optional_integer(
+            raw.get('source_custom_format_minimum_score'),
+            'source_custom_format_minimum_score', minimum=-2147483648),
         'source_tag_filter': _string_list(raw.get('source_tag_filter')),
         'source_tag_filter_id': _int_list(raw.get('source_tag_filter_id'), 'source_tag_filter_id'),
         'source_blacklist': _string_list(raw.get('source_blacklist')),
         'target_profile': _optional_text(raw.get('target_profile')),
         'target_profile_id': _optional_int(raw.get('target_profile_id'), 'target_profile_id'),
-        'target_language': _optional_text(raw.get('target_language')),
-        'target_language_id': _optional_int(raw.get('target_language_id'), 'target_language_id'),
         'target_root_path': _optional_text(raw.get('target_root_path')),
         'root_mappings': root_mappings,
         'auto_search': _boolean(raw.get('auto_search', True), 'auto_search'),
@@ -228,6 +238,36 @@ def _normalize_job(raw, index, instances, global_test_run):
     }
     if job['target_profile'] is None and job['target_profile_id'] is None:
         raise ConfigurationError('Job {} needs target_profile or target_profile_id'.format(job_id))
+    if _optional_text(raw.get('target_language')) or _optional_text(raw.get('target_language_id')):
+        raise ConfigurationError(
+            'Job {} target language settings are legacy Sonarr v3 only'.format(job_id))
+    if job['source_quality_match'] and source['type'] not in ('radarr', 'sonarr'):
+        raise ConfigurationError('Job {} file quality filters require Radarr or Sonarr'.format(job_id))
+    mode = job['source_custom_format_mode']
+    if mode is None:
+        if (job['source_custom_format_names'] or job['source_custom_format_exclude_names'] or
+                job['source_custom_format_minimum_score'] is not None):
+            raise ConfigurationError(
+                'Job {} custom format settings require source_custom_format_mode'.format(job_id))
+    else:
+        if mode not in CUSTOM_FORMAT_MODES:
+            raise ConfigurationError('Job {} has an invalid source_custom_format_mode'.format(job_id))
+        if source['type'] not in ('radarr', 'sonarr'):
+            raise ConfigurationError('Job {} custom format filters require Radarr or Sonarr'.format(job_id))
+        if mode in ('any', 'all'):
+            if not job['source_custom_format_names']:
+                raise ConfigurationError(
+                    'Job {} any/all custom format modes need source_custom_format_names'.format(job_id))
+            if job['source_custom_format_minimum_score'] is not None:
+                raise ConfigurationError(
+                    'Job {} score thresholds can only be used with mode score'.format(job_id))
+        elif job['source_custom_format_minimum_score'] is None:
+            raise ConfigurationError(
+                'Job {} score mode needs source_custom_format_minimum_score'.format(job_id))
+        elif job['source_custom_format_names'] or job['source_custom_format_exclude_names']:
+            raise ConfigurationError(
+                'Job {} names and exclusions can only be used with mode any or all'.format(job_id))
+    job['has_file_filters'] = bool(job['source_quality_match'] or mode)
     if job['source_quality_match']:
         try:
             re.compile(job['source_quality_match'])
@@ -276,6 +316,12 @@ def _optional_int(value, name):
     return _integer(value, name, minimum=1)
 
 
+def _optional_integer(value, name, minimum):
+    if value is None or str(value).strip() == '':
+        return None
+    return _integer(value, name, minimum=minimum)
+
+
 def _int_list(value, name):
     values = _string_list(value)
     return [_integer(item, name, minimum=1) for item in values]
@@ -298,6 +344,11 @@ def _optional_text(value):
         return None
     value = str(value).strip()
     return value if value else None
+
+
+def _optional_lower_text(value):
+    value = _optional_text(value)
+    return value.lower() if value else None
 
 
 def _boolean(value, name):
