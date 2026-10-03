@@ -3,6 +3,8 @@
 
 import json
 import logging
+import ntpath
+import posixpath
 import re
 import time
 
@@ -202,6 +204,22 @@ def map_root_path(content_path, job):
     if not parent and (normalized.startswith('/') or re.match(r'^[A-Za-z]:[/\\]', normalized)):
         parent = normalized[:1] if normalized.startswith('/') else normalized[:3]
     return parent or None, None if parent else 'could not determine a source root'
+
+
+def _movie_path_in_root(root_path, current_path):
+    """Return the existing movie folder under a new root, preserving its leaf name."""
+    if not isinstance(root_path, str) or not root_path.strip():
+        return None
+    if not isinstance(current_path, str) or not current_path.strip():
+        return None
+
+    windows_path = ('\\' in root_path or
+                    bool(re.match(r'^[A-Za-z]:[/\\]', root_path)))
+    path_module = ntpath if windows_path else posixpath
+    folder_name = path_module.basename(current_path.rstrip('/\\'))
+    if not folder_name or folder_name in ('.', '..'):
+        return None
+    return path_module.normpath(path_module.join(root_path, folder_name))
 
 
 def _content_key(content, arr_type):
@@ -601,6 +619,15 @@ def _sync_items(job, source_client, target_client, tag_id, source_items, target_
         current_tags = list(current.get('tags') or [])
         changed = False
         change_reasons = []
+        if (arr_type == 'radarr' and not _has_file(current) and
+                content.get('path') and current.get('path')):
+            root_path = _path_for_content(content, job, target_client)
+            movie_path = _movie_path_in_root(root_path, current.get('path'))
+            if movie_path and _path_key(movie_path) != _path_key(current.get('path')):
+                current['path'] = movie_path
+                current['rootFolderPath'] = root_path
+                changed = True
+                change_reasons.append('target_root_changed')
         if tag_id is not None and tag_id not in current_tags:
             current_tags.append(tag_id)
             current['tags'] = current_tags
@@ -621,8 +648,9 @@ def _sync_items(job, source_client, target_client, tag_id, source_items, target_
             _log_entity(job, target_client, 'update', 'target_state_differs', content,
                         **details)
             if not job['test_run']:
+                params = {'moveFiles': 'false'} if 'target_root_changed' in change_reasons else None
                 target_client.request('PUT', '{}/{}'.format(target_client.content_route, current['id']),
-                                      payload=current, expected=(200, 202))
+                                      params=params, payload=current, expected=(200, 202))
         else:
             _log_entity(job, target_client, 'skip', 'target_already_in_sync', content,
                         target_record_id=current.get('id'), level=logging.DEBUG)

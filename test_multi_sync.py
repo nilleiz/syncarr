@@ -233,6 +233,104 @@ class FileFilterTests(unittest.TestCase):
         sonarr.close()
 
 
+class RadarrRootPathTests(unittest.TestCase):
+    def make_fixture(self, target_has_file=False):
+        source = FakeRadarrClient(('radarr', 'http://source'), [{
+            'id': 10,
+            'tmdbId': 100,
+            'title': 'Example Movie',
+            'path': '/source/movies/Example Movie (2020)',
+            'hasFile': True,
+            'monitored': False,
+        }])
+        source.movie_files[10] = [{
+            'id': 101,
+            'quality': {'quality': {'name': 'Bluray-2160p'}},
+            'customFormats': [{'name': 'Dolby Vision without fallback'}],
+        }]
+        target_movie = {
+            'id': 20,
+            'tmdbId': 100,
+            'title': 'Example Movie',
+            'path': '/old/movies/Example Movie (2020)',
+            'rootFolderPath': '/old/movies',
+            'hasFile': target_has_file,
+            'monitored': True,
+            'tags': [7],
+        }
+        target = FakeRadarrClient(('radarr', 'http://target'), [target_movie])
+        job = _job(
+            'movies', source, target, 7,
+            root_mappings=[{'source': '/source/movies', 'target': '/new/movies'}],
+            target_root_path=None,
+        )
+        return source, target, job, target_movie
+
+    def test_fileless_existing_movie_updates_path_without_moving_files(self):
+        source, target, job, target_movie = self.make_fixture()
+
+        _sync_items(job, source, target, 7, source.items, [target_movie])
+
+        self.assertEqual(len(target.calls), 1)
+        method, route, params, payload = target.calls[0]
+        self.assertEqual((method, route, params),
+                         ('PUT', 'movie/20', {'moveFiles': 'false'}))
+        self.assertEqual(payload['path'], '/new/movies/Example Movie (2020)')
+        self.assertEqual(payload['rootFolderPath'], '/new/movies')
+        self.assertFalse(payload['hasFile'])
+
+    def test_existing_movie_with_file_keeps_path_and_root_during_other_updates(self):
+        source, target, job, target_movie = self.make_fixture(target_has_file=True)
+        target_movie['movieFile'] = {'id': 900}
+        target_movie['monitored'] = True
+        job['sync_monitor'] = True
+
+        _sync_items(job, source, target, 7, source.items, [target_movie])
+
+        self.assertEqual(len(target.calls), 1)
+        method, route, params, payload = target.calls[0]
+        self.assertEqual((method, route, params), ('PUT', 'movie/20', None))
+        self.assertEqual(payload['path'], '/old/movies/Example Movie (2020)')
+        self.assertEqual(payload['rootFolderPath'], '/old/movies')
+        self.assertEqual(target_movie['path'], '/old/movies/Example Movie (2020)')
+
+    def test_file_filter_mismatch_does_not_change_fileless_target_path(self):
+        source, target, job, target_movie = self.make_fixture()
+        source.movie_files[10][0]['customFormats'] = [{'name': 'HDR10 fallback'}]
+
+        _sync_items(job, source, target, 7, source.items, [target_movie])
+
+        self.assertEqual(target.calls, [])
+        self.assertEqual(target_movie['path'], '/old/movies/Example Movie (2020)')
+        self.assertEqual(target_movie['rootFolderPath'], '/old/movies')
+
+    def test_new_movie_still_uses_the_mapped_destination_root(self):
+        source, target, job, unused_target_movie = self.make_fixture()
+        job['resolved_profile_id'] = 1
+
+        _sync_items(job, source, target, 7, source.items, [])
+
+        method, route, unused_params, payload = target.calls[0]
+        self.assertEqual((method, route), ('POST', 'movie'))
+        self.assertEqual(payload['rootFolderPath'], '/new/movies')
+
+    def test_one_time_sync_maps_fileless_target_before_reinitialize_search(self):
+        source, target, job, target_movie = self.make_fixture()
+        target_movie['monitored'] = False
+        clients = {source.identity: source, target.identity: target}
+
+        with patch('multi_sync._create_clients', return_value=clients):
+            result = run_once({'instances': {}, 'jobs': [job]})
+
+        self.assertEqual(result, 0)
+        self.assertEqual([call[0] for call in target.calls],
+                         ['PUT', 'UPDATE_MOVIE', 'SEARCH_MOVIES'])
+        self.assertEqual(target.calls[0][3]['path'],
+                         '/new/movies/Example Movie (2020)')
+        self.assertEqual(target.calls[1][2]['path'],
+                         '/new/movies/Example Movie (2020)')
+
+
 class RadarrDeletionPresenceTests(unittest.TestCase):
     def make_fixture(self, source_movies, **changes):
         source = FakeRadarrClient(('radarr', 'http://source'), source_movies)
