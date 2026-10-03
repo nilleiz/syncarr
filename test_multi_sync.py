@@ -306,6 +306,7 @@ class RadarrRootPathTests(unittest.TestCase):
 
     def test_new_movie_still_uses_the_mapped_destination_root(self):
         source, target, job, unused_target_movie = self.make_fixture()
+        job['resolved_profile_id'] = 1
 
         _sync_items(job, source, target, 7, source.items, [])
 
