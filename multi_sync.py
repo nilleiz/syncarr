@@ -141,6 +141,15 @@ class ArrClient(object):
                              'addImportExclusion': 'false'},
                      expected=(200, 202, 204))
 
+    def update_movie(self, movie):
+        self.request('PUT', 'movie/{}'.format(movie['id']), payload=movie,
+                     expected=(200, 202))
+
+    def search_movies(self, movie_ids):
+        self.request('POST', 'command',
+                     payload={'name': 'MoviesSearch', 'movieIds': list(movie_ids)},
+                     expected=(200, 201, 202))
+
     def close(self):
         self.session.close()
 
@@ -518,10 +527,18 @@ def _prepare_job(job, clients, create_tags):
 
 
 def _sync_items(job, source_client, target_client, tag_id, source_items, target_items,
-                episode_cache=None, movie_file_cache=None):
+                episode_cache=None, movie_file_cache=None, run_context=None):
     episode_cache = {} if episode_cache is None else episode_cache
     movie_file_cache = {} if movie_file_cache is None else movie_file_cache
-    profile_filter_id, tag_filter_ids = _resolve_source_filters(source_client, job)
+    try:
+        profile_filter_id, tag_filter_ids = _resolve_source_filters(source_client, job)
+    except Exception:
+        if run_context is not None:
+            run_context.setdefault('resolved_source_filters', {})[job['id']] = None
+        raise
+    if run_context is not None:
+        run_context.setdefault('resolved_source_filters', {})[job['id']] = (
+            profile_filter_id, tag_filter_ids)
     arr_type = source_client.arr_type
     target_by_key = {}
     for item in target_items:
@@ -963,19 +980,33 @@ def _apply_sonarr_episode_plan(plans, current_job, target_client):
                                   expected=(200, 201, 202))
 
 
-def run_job(config, job, clients):
+def _list_job_source_items(source_client, job, run_context):
+    try:
+        source_items = source_client.list_content()
+    except Exception:
+        if run_context is not None:
+            run_context.setdefault('source_contents_by_job', {})[job['id']] = None
+        raise
+    if run_context is not None:
+        run_context.setdefault('source_contents_by_job', {})[job['id']] = source_items
+    return source_items
+
+
+def run_job(config, job, clients, run_context=None):
     source_client, target_client, tag_id = _prepare_job(job, clients, create_tags=not job['test_run'])
-    source_items = source_client.list_content()
+    source_items = _list_job_source_items(source_client, job, run_context)
     target_items = target_client.list_content()
     episode_cache = {}
-    movie_file_cache = {}
+    movie_file_cache = (run_context.setdefault('movie_file_cache', {})
+                        if run_context is not None else {})
     try:
         _sync_items(job, source_client, target_client, tag_id, source_items, target_items,
-                    episode_cache=episode_cache, movie_file_cache=movie_file_cache)
+                    episode_cache=episode_cache, movie_file_cache=movie_file_cache,
+                    run_context=run_context)
     except MovieFileInventoryError as error:
         LOGGER.error('Job %s will not continue because its source movie-file inventory failed (%s)',
                      job['id'], error)
-        return
+        return False
 
     if target_client.arr_type == 'sonarr':
         incoming_jobs = _target_group(config, target_client.identity)
@@ -988,7 +1019,8 @@ def run_job(config, job, clients):
                     if source_identity not in source_snapshots:
                         incoming_client = clients[source_identity]
                         contents = (source_items if incoming_client.identity == source_client.identity
-                                    else incoming_client.list_content())
+                                    else _list_job_source_items(incoming_client, incoming_job,
+                                                                run_context))
                         source_snapshots[source_identity] = contents
                 # The just-added series and its episode IDs must be visible before we
                 # reconcile individual episode monitoring and file deletion.
@@ -998,12 +1030,12 @@ def run_job(config, job, clients):
             except SyncError as error:
                 LOGGER.error('Job %s will not reconcile Sonarr episode state because an inventory failed (%s)',
                              job['id'], error)
-                return
+                return False
             _apply_sonarr_episode_plan(plans, job, target_client)
-        return
+        return True
 
     if not job['delete_missing']:
-        return
+        return True
     incoming_jobs = _target_group(config, target_client.identity)
     source_snapshots = {}
     safe_to_delete = True
@@ -1013,14 +1045,15 @@ def run_job(config, job, clients):
             continue
         incoming_client = clients[source_key]
         try:
-            contents = source_items if incoming_client.identity == source_client.identity else incoming_client.list_content()
+            contents = (source_items if incoming_client.identity == source_client.identity
+                        else _list_job_source_items(incoming_client, incoming_job, run_context))
             source_snapshots[source_key] = {'client': incoming_client, 'contents': contents}
         except SyncError as error:
             LOGGER.error('Job %s will not delete from its target because a source inventory failed (%s)',
                          job['id'], error)
             safe_to_delete = False
     if not safe_to_delete:
-        return
+        return False
 
     try:
         _load_radarr_movie_file_inventories(
@@ -1028,14 +1061,14 @@ def run_job(config, job, clients):
     except SyncError as error:
         LOGGER.error('Job %s will not delete from its target because a required source movie-file inventory was unavailable or incomplete (%s)',
                      job['id'], error)
-        return
+        return False
     try:
         candidates = _items_for_deletion(
             target_items, incoming_jobs, source_snapshots, target_client)
     except SyncError as error:
         LOGGER.error('Job %s will not delete from its target because deletion planning data was unavailable or incomplete (%s)',
                      job['id'], error)
-        return
+        return False
 
     for item, authors in candidates:
         if job not in authors:
@@ -1062,14 +1095,221 @@ def run_job(config, job, clients):
             continue
         target_client.delete_movie(item['id'], delete_files)
 
+    return True
 
-def run(config):
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+
+def _radarr_target_groups(config):
+    groups = {}
+    for job in config['jobs']:
+        if job['target']['type'] == 'radarr':
+            groups.setdefault(job['target']['identity'], []).append(job)
+    return groups
+
+
+def _reinitialize_radarr_target(incoming_jobs, target_client, initial_target_ids,
+                                clients, run_context):
+    """Reactivate pre-existing fileless Radarr movies that pass any incoming job."""
+    try:
+        target_items = target_client.list_content()
+    except Exception as error:
+        LOGGER.error('Could not inspect Radarr target for reinitialization (%s)',
+                     error.__class__.__name__)
+        return False
+
+    target_by_key = {}
+    for item in target_items:
+        if item.get('id') not in initial_target_ids or _has_file(item):
+            continue
+        key = _content_key(item, 'radarr')
+        if key is not None:
+            target_by_key.setdefault(key, []).append(item)
+
+    duplicates = {key for key, items in target_by_key.items() if len(items) > 1}
+    success = True
+    for key in duplicates:
+        LOGGER.error('Radarr reinitialization skipped a duplicate target movie ID')
+        target_by_key.pop(key, None)
+        success = False
+    if not target_by_key:
+        return success
+
+    source_by_job = {}
+    resolved_filters = run_context.get('resolved_source_filters', {})
+    source_contents = run_context.get('source_contents_by_job', {})
+    for job in incoming_jobs:
+        identity = job['source']['identity']
+        contents = source_contents.get(job['id'])
+        if contents is None:
+            LOGGER.error('Job %s source inventory is unavailable for the Radarr recovery pass',
+                         job['id'])
+            success = False
+            continue
+        if job['id'] not in resolved_filters or resolved_filters[job['id']] is None:
+            LOGGER.error('Job %s source filters are unavailable for the Radarr recovery pass',
+                         job['id'])
+            success = False
+            continue
+        source_by_job[job['id']] = {}
+        for content in contents:
+            content_key = _content_key(content, 'radarr')
+            if content_key is not None:
+                source_by_job[job['id']].setdefault(content_key, content)
+
+    movie_file_cache = run_context.get('movie_file_cache', {})
+    for key, target_movie_matches in target_by_key.items():
+        target_movie = target_movie_matches[0]
+        qualifying_jobs = []
+        for job in incoming_jobs:
+            identity = job['source']['identity']
+            if job['id'] not in source_by_job or job['id'] not in resolved_filters:
+                continue
+            source_movie = source_by_job[job['id']].get(key)
+            if not isinstance(source_movie, dict) or source_movie.get('hasFile') is not True:
+                continue
+            profile_filter_id, tag_filter_ids = resolved_filters[job['id']]
+            source_client = clients[identity]
+            if not _passes_filters(source_movie, source_client, job,
+                                   profile_filter_id, tag_filter_ids):
+                continue
+
+            if job['has_file_filters']:
+                movie_id = source_movie.get('id')
+                if movie_id is None:
+                    LOGGER.error('Job %s source movie has no ID for its file-filter inventory',
+                                 job['id'])
+                    success = False
+                    continue
+                cache_key = (source_client.identity, movie_id)
+                if cache_key not in movie_file_cache:
+                    LOGGER.error('Job %s source movie-file inventory is unavailable for the Radarr recovery pass',
+                                 job['id'])
+                    success = False
+                    continue
+                movie_files = movie_file_cache[cache_key]
+                if not any(_passes_file_filters(file_record, job)
+                           for file_record in movie_files):
+                    continue
+            qualifying_jobs.append(job)
+
+        if not qualifying_jobs:
+            continue
+
+        live_jobs = [job for job in qualifying_jobs if not job['test_run']]
+        action_job = live_jobs[0] if live_jobs else qualifying_jobs[0]
+        mode = 'live' if live_jobs else 'dry_run'
+        outcome = 'attempted' if live_jobs else 'would_apply'
+        details = {
+            'target_record_id': target_movie.get('id'),
+            'target_has_file': False,
+            'source_has_file': True,
+            'qualifying_job_ids': sorted(job['id'] for job in qualifying_jobs),
+        }
+
+        if not target_movie.get('monitored', False):
+            _log_entity(action_job, target_client, 'update_movie_monitoring',
+                        'reinitialize_b_missing_file', target_movie,
+                        entity_side='target', mode=mode,
+                        change_reasons=['reinitialize_b_missing_file'],
+                        monitored=True, outcome=outcome, **details)
+            if live_jobs:
+                updated_movie = dict(target_movie)
+                updated_movie['monitored'] = True
+                try:
+                    target_client.update_movie(updated_movie)
+                except Exception as error:
+                    LOGGER.error('Radarr movie %s could not be reactivated (%s)',
+                                 key, error.__class__.__name__)
+                    success = False
+                    continue
+
+        _log_entity(action_job, target_client, 'search_movie',
+                    'reinitialize_b_missing_file', target_movie,
+                    entity_side='target', mode=mode, outcome=outcome, **details)
+        if live_jobs:
+            try:
+                target_client.search_movies([target_movie['id']])
+            except Exception as error:
+                LOGGER.error('Radarr movie %s search could not be started (%s)',
+                             key, error.__class__.__name__)
+                success = False
+
+    return success
+
+
+def _create_clients(config):
     clients = {}
     for instance in config['instances'].values():
         key = (instance['type'], instance['url'])
         if key not in clients:
             clients[key] = ArrClient(instance)
+    return clients
+
+
+def run_once(config):
+    """Execute every configured job once, then perform Radarr B recovery."""
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+    clients = _create_clients(config)
+    success = True
+    target_groups = _radarr_target_groups(config)
+    initial_target_ids = {}
+    run_context = {
+        'source_contents_by_job': {},
+        'resolved_source_filters': {},
+        'movie_file_cache': {},
+    }
+
+    try:
+        for identity in target_groups:
+            try:
+                target_items = clients[identity].list_content()
+                initial_target_ids[identity] = {
+                    item.get('id') for item in target_items
+                    if isinstance(item, dict) and item.get('id') is not None
+                }
+            except Exception as error:
+                LOGGER.error('Could not snapshot a Radarr target before the one-time run (%s)',
+                             error.__class__.__name__)
+                initial_target_ids[identity] = None
+                success = False
+
+        LOGGER.info('Starting one-time run with %d configured jobs', len(config['jobs']))
+        for job in config['jobs']:
+            try:
+                if run_job(config, job, clients, run_context=run_context) is not True:
+                    LOGGER.error('Job %s reported an incomplete run', job['id'])
+                    success = False
+            except SyncError as error:
+                LOGGER.error('Job %s failed: %s', job['id'], error)
+                success = False
+            except Exception as error:
+                LOGGER.exception('Job %s failed unexpectedly (%s)',
+                                 job['id'], error.__class__.__name__)
+                success = False
+
+        for identity, incoming_jobs in target_groups.items():
+            baseline = initial_target_ids.get(identity)
+            if baseline is None:
+                continue
+            try:
+                target_succeeded = _reinitialize_radarr_target(
+                    incoming_jobs, clients[identity], baseline, clients, run_context)
+            except Exception as error:
+                LOGGER.exception('Radarr reinitialization failed unexpectedly (%s)',
+                                 error.__class__.__name__)
+                target_succeeded = False
+            if not target_succeeded:
+                success = False
+
+        LOGGER.info('One-time run completed with status %s', 0 if success else 1)
+        return 0 if success else 1
+    finally:
+        for client in clients.values():
+            client.close()
+
+
+def run(config):
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+    clients = _create_clients(config)
 
     next_runs = dict((job['id'], 0) for job in config['jobs'])
     LOGGER.info('Starting multi-job mode with %d configured jobs', len(config['jobs']))

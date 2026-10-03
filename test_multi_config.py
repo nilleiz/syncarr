@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 
 from multi_config import ConfigurationError, _normalize_instance, _normalize_job, load_multi_job_config
@@ -98,6 +100,7 @@ class MultiJobConfigTests(unittest.TestCase):
         self.assertEqual(job['source_custom_format_names'], ['DV', 'HDR'])
         self.assertEqual(job['source_custom_format_exclude_names'], ['SDR fallback'])
         self.assertFalse(job['delete_if_filter_not_matching'])
+        self.assertFalse(config['reinitialize_b'])
 
     def test_indexed_radarr_filter_mismatch_deletion_environment_setting(self):
         env = {
@@ -121,6 +124,71 @@ class MultiJobConfigTests(unittest.TestCase):
         job = load_multi_job_config(env)['jobs'][0]
         self.assertTrue(job['delete_missing'])
         self.assertTrue(job['delete_if_filter_not_matching'])
+
+    def test_reinitialize_b_can_be_enabled_in_indexed_environment(self):
+        env = {
+            'SYNCARR_INSTANCE_COUNT': '2',
+            'SYNCARR_JOB_COUNT': '1',
+            'SYNCARR_INSTANCE_1_ID': 'source',
+            'SYNCARR_INSTANCE_1_TYPE': 'radarr',
+            'SYNCARR_INSTANCE_1_URL': 'http://source',
+            'SYNCARR_INSTANCE_1_API_KEY': 'source-key',
+            'SYNCARR_INSTANCE_2_ID': 'target',
+            'SYNCARR_INSTANCE_2_TYPE': 'radarr',
+            'SYNCARR_INSTANCE_2_URL': 'http://target',
+            'SYNCARR_INSTANCE_2_API_KEY': 'target-key',
+            'SYNCARR_JOB_1_ID': 'movies',
+            'SYNCARR_JOB_1_SOURCE': 'source',
+            'SYNCARR_JOB_1_TARGET': 'target',
+            'SYNCARR_JOB_1_TARGET_PROFILE_ID': '1',
+            'SYNCARR_REINITIALIZE_B': 'true',
+        }
+        config = load_multi_job_config(env)
+        self.assertTrue(config['reinitialize_b'])
+
+    def test_reinitialize_b_requires_multi_job_configuration(self):
+        with self.assertRaisesRegex(ConfigurationError, 'requires multi-job configuration'):
+            load_multi_job_config({'SYNCARR_REINITIALIZE_B': 'true'})
+
+    def test_reinitialize_b_defaults_off_and_yaml_can_enable_it(self):
+        yaml_config = """instances:
+  source:
+    type: radarr
+    url_env: SOURCE_URL
+    api_key_env: SOURCE_KEY
+  target:
+    type: radarr
+    url_env: TARGET_URL
+    api_key_env: TARGET_KEY
+jobs:
+  - id: movies
+    source: source
+    target: target
+    target_profile_id: 1
+"""
+        env = {
+            'SOURCE_URL': 'http://source',
+            'SOURCE_KEY': 'source-key',
+            'TARGET_URL': 'http://target',
+            'TARGET_KEY': 'target-key',
+        }
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as config_file:
+            config_file.write(yaml_config)
+            config_path = config_file.name
+        try:
+            env['SYNCARR_CONFIG'] = config_path
+            self.assertFalse(load_multi_job_config(env)['reinitialize_b'])
+
+            with open(config_path, 'w') as config_file:
+                config_file.write('reinitialize_b: true\n' + yaml_config)
+            self.assertTrue(load_multi_job_config(env)['reinitialize_b'])
+
+            with open(config_path, 'w') as config_file:
+                config_file.write(yaml_config)
+            env['SYNCARR_REINITIALIZE_B'] = '1'
+            self.assertTrue(load_multi_job_config(env)['reinitialize_b'])
+        finally:
+            os.unlink(config_path)
 
 
 if __name__ == '__main__':

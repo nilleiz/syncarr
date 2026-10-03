@@ -3,9 +3,11 @@ import unittest
 
 from unittest.mock import patch
 
+import index
 from multi_sync import (ArrClient, SyncError, _apply_sonarr_episode_plan,
                         _items_for_deletion, _passes_file_filters, _passes_filters,
-                        _sonarr_episode_plan, _sync_items, rule_tag, run_job)
+                        _reinitialize_radarr_target, _sonarr_episode_plan, _sync_items,
+                        rule_tag, run_job, run_once)
 
 
 class FakeSonarrClient(object):
@@ -62,6 +64,7 @@ class FakeRadarrClient(object):
         self.tag_ids = {}
         self.deleted_movies = []
         self.list_content_calls = 0
+        self.calls = []
 
     def list_content(self):
         self.list_content_calls += 1
@@ -82,10 +85,25 @@ class FakeRadarrClient(object):
         return self.tag_ids.get(label)
 
     def request(self, method, route, params=None, payload=None, expected=None):
+        self.calls.append((method, route, params, payload))
         return None
 
     def delete_movie(self, content_id, delete_files):
         self.deleted_movies.append((content_id, delete_files))
+        self.calls.append(('DELETE_MOVIE', content_id, delete_files))
+
+    def update_movie(self, movie):
+        self.calls.append(('UPDATE_MOVIE', movie['id'], dict(movie)))
+        for current in self.items:
+            if current.get('id') == movie['id']:
+                current.update(movie)
+                break
+
+    def search_movies(self, movie_ids):
+        self.calls.append(('SEARCH_MOVIES', list(movie_ids)))
+
+    def close(self):
+        pass
 
 
 def _episode(number, file_id, monitored, quality, formats=None, score=0):
@@ -137,6 +155,7 @@ def _job(job_id, source, target, tag_id, **changes):
         'test_run': False,
         'auto_search': True,
         'monitor_new_content': True,
+        'sync_monitor': False,
         'skip_missing': True,
     }
     job.update(changes)
@@ -195,6 +214,15 @@ class FileFilterTests(unittest.TestCase):
         with patch.object(radarr, 'request', return_value=[]) as request:
             radarr.list_movie_files(19)
         request.assert_called_once_with('GET', 'moviefile', params={'movieId': 19}, expected=(200,))
+        with patch.object(radarr, 'request', return_value=[]) as request:
+            radarr.search_movies([19])
+        request.assert_called_once_with(
+            'POST', 'command', payload={'name': 'MoviesSearch', 'movieIds': [19]},
+            expected=(200, 201, 202))
+        with patch.object(radarr, 'request', return_value=[]) as request:
+            radarr.update_movie({'id': 19, 'monitored': True})
+        request.assert_called_once_with(
+            'PUT', 'movie/19', payload={'id': 19, 'monitored': True}, expected=(200, 202))
         radarr.close()
 
         sonarr = ArrClient({'type': 'sonarr', 'url': 'http://sonarr', 'api_key': 'test'})
@@ -684,6 +712,275 @@ class EntityLoggingTests(unittest.TestCase):
                          dict(live, mode=None, outcome=None))
         self.assertEqual(targets[0].deleted_movies, [])
         self.assertEqual(targets[1].deleted_movies, [(20, True)])
+
+
+class RadarrReinitializationTests(unittest.TestCase):
+    def make_fixture(self):
+        source = FakeRadarrClient(('radarr', 'http://source'), [{
+            'id': 10,
+            'tmdbId': 100,
+            'title': 'Example Movie',
+            'hasFile': True,
+            'monitored': False,
+        }])
+        source.movie_files[10] = [{
+            'id': 101,
+            'quality': {'quality': {'name': 'Bluray-2160p'}},
+            'customFormats': [{'name': 'Dolby Vision without fallback'}],
+        }]
+        target_movie = {
+            'id': 20,
+            'tmdbId': 100,
+            'title': 'Example Movie',
+            'hasFile': False,
+            'monitored': False,
+        }
+        target = FakeRadarrClient(('radarr', 'http://target'), [target_movie])
+        job = _job('movies', source, target, 7)
+        return source, target, job, target_movie
+
+    def make_run_context(self, jobs, clients):
+        context = {
+            'source_contents_by_job': {},
+            'resolved_source_filters': {},
+            'movie_file_cache': {},
+        }
+        for job in jobs:
+            source = clients[job['source']['identity']]
+            context['source_contents_by_job'][job['id']] = source.items
+            context['resolved_source_filters'][job['id']] = (None, set())
+            if job['has_file_filters']:
+                for movie in source.items:
+                    if movie.get('hasFile') is True:
+                        context['movie_file_cache'][(source.identity, movie['id'])] = (
+                            source.movie_files[movie['id']])
+        return context
+
+    def test_reactivates_fileless_target_from_unmonitored_source_and_searches(self):
+        source, target, job, target_movie = self.make_fixture()
+
+        success = _reinitialize_radarr_target(
+            [job], target, {20}, {source.identity: source, target.identity: target},
+            self.make_run_context([job], {source.identity: source}))
+
+        self.assertTrue(success)
+        self.assertTrue(target_movie['monitored'])
+        self.assertEqual([call[0] for call in target.calls],
+                         ['UPDATE_MOVIE', 'SEARCH_MOVIES'])
+        self.assertEqual(target.calls[-1], ('SEARCH_MOVIES', [20]))
+
+    def test_file_filter_mismatch_does_not_reactivate_target(self):
+        source, target, job, unused_target_movie = self.make_fixture()
+        source.movie_files[10][0]['quality']['quality']['name'] = 'WEBDL-1080p'
+
+        success = _reinitialize_radarr_target(
+            [job], target, {20}, {source.identity: source, target.identity: target},
+            self.make_run_context([job], {source.identity: source}))
+
+        self.assertTrue(success)
+        self.assertEqual(target.calls, [])
+
+    def test_target_with_file_is_not_reinitialized(self):
+        source, target, job, target_movie = self.make_fixture()
+        target_movie['hasFile'] = True
+
+        success = _reinitialize_radarr_target(
+            [job], target, {20}, {source.identity: source, target.identity: target},
+            self.make_run_context([job], {source.identity: source}))
+
+        self.assertTrue(success)
+        self.assertEqual(target.calls, [])
+
+    def test_only_preexisting_target_records_are_reinitialized(self):
+        source, target, job, unused_target_movie = self.make_fixture()
+
+        success = _reinitialize_radarr_target(
+            [job], target, set(), {source.identity: source, target.identity: target},
+            self.make_run_context([job], {source.identity: source}))
+
+        self.assertTrue(success)
+        self.assertEqual(target.calls, [])
+        self.assertEqual(source.list_content_calls, 0)
+
+    def test_overlapping_jobs_reinitialize_and_search_movie_once(self):
+        source_a, target, job_a, unused_target_movie = self.make_fixture()
+        source_b = FakeRadarrClient(('radarr', 'http://source-b'), [{
+            'id': 11,
+            'tmdbId': 100,
+            'title': 'Example Movie',
+            'hasFile': True,
+            'monitored': False,
+        }])
+        source_b.movie_files[11] = list(source_a.movie_files[10])
+        job_b = _job('movies-b', source_b, target, 8)
+        target.calls = []
+
+        success = _reinitialize_radarr_target(
+            [job_a, job_b], target, {20},
+            {source_a.identity: source_a, source_b.identity: source_b,
+             target.identity: target},
+            self.make_run_context([job_a, job_b],
+                                  {source_a.identity: source_a,
+                                   source_b.identity: source_b}))
+
+        self.assertTrue(success)
+        self.assertEqual([call[0] for call in target.calls],
+                         ['UPDATE_MOVIE', 'SEARCH_MOVIES'])
+
+    def test_one_matching_job_is_enough_when_another_job_does_not_match(self):
+        source_a, target, job_a, unused_target_movie = self.make_fixture()
+        source_b = FakeRadarrClient(('radarr', 'http://source-b'), [{
+            'id': 11,
+            'tmdbId': 100,
+            'title': 'Example Movie',
+            'hasFile': True,
+            'monitored': False,
+        }])
+        source_b.movie_files[11] = [{
+            'quality': {'quality': {'name': 'Bluray-2160p'}},
+            'customFormats': [{'name': 'HDR10 fallback'}],
+        }]
+        job_b = _job('movies-b', source_b, target, 8)
+
+        with self.assertLogs('syncarr', level='INFO') as captured:
+            success = _reinitialize_radarr_target(
+                [job_a, job_b], target, {20},
+                {source_a.identity: source_a, source_b.identity: source_b,
+                 target.identity: target},
+                self.make_run_context([job_a, job_b],
+                                      {source_a.identity: source_a,
+                                       source_b.identity: source_b}))
+
+        events = _entity_events(captured)
+        self.assertTrue(success)
+        self.assertEqual([call[0] for call in target.calls],
+                         ['UPDATE_MOVIE', 'SEARCH_MOVIES'])
+        self.assertTrue(all(event['qualifying_job_ids'] == ['movies'] for event in events))
+
+    def test_one_time_runner_snapshots_before_jobs_then_runs_recovery(self):
+        source, target, job, unused_target_movie = self.make_fixture()
+        config = {'instances': {}, 'jobs': [job]}
+        clients = {source.identity: source, target.identity: target}
+
+        with patch('multi_sync._create_clients', return_value=clients), \
+                patch('multi_sync.run_job', wraps=run_job) as job_runner:
+            result = run_once(config)
+
+        self.assertEqual(result, 0)
+        job_runner.assert_called_once()
+        self.assertEqual([call[0] for call in target.calls[-2:]],
+                         ['UPDATE_MOVIE', 'SEARCH_MOVIES'])
+        self.assertEqual(source.list_content_calls, 1)
+        self.assertEqual(source.movie_file_calls, [10])
+
+    def test_one_time_dry_run_logs_recovery_and_delete_without_writes(self):
+        source, target, job, target_movie = self.make_fixture()
+        target_movie['tags'] = [7]
+        target.items.append({
+            'id': 22,
+            'tmdbId': 101,
+            'title': 'Missing Movie',
+            'hasFile': True,
+            'monitored': True,
+            'tags': [7],
+        })
+        job['test_run'] = True
+        job['delete_missing'] = True
+        job['delete_scope'] = 'all_missing'
+        config = {'instances': {}, 'jobs': [job]}
+        clients = {source.identity: source, target.identity: target}
+
+        with self.assertLogs('syncarr', level='INFO') as captured, \
+                patch('multi_sync._create_clients', return_value=clients):
+            result = run_once(config)
+
+        events = _entity_events(captured)
+        actions = [event['action'] for event in events]
+        self.assertEqual(result, 0)
+        self.assertIn('delete_movie', actions)
+        self.assertIn('update_movie_monitoring', actions)
+        self.assertIn('search_movie', actions)
+        self.assertTrue(all(event['outcome'] == 'would_apply' for event in events))
+        self.assertEqual(target.calls, [])
+        self.assertEqual(target.deleted_movies, [])
+
+    def test_dry_run_logs_reactivation_and_search_without_radarr_writes(self):
+        source, target, job, unused_target_movie = self.make_fixture()
+        job['test_run'] = True
+
+        with self.assertLogs('syncarr', level='INFO') as captured:
+            success = _reinitialize_radarr_target(
+                [job], target, {20}, {source.identity: source, target.identity: target},
+                self.make_run_context([job], {source.identity: source}))
+
+        events = _entity_events(captured)
+        self.assertTrue(success)
+        self.assertEqual([event['action'] for event in events],
+                         ['update_movie_monitoring', 'search_movie'])
+        self.assertTrue(all(event['outcome'] == 'would_apply' for event in events))
+        self.assertEqual(target.calls, [])
+
+
+class RunOnceTests(unittest.TestCase):
+    def make_config(self, results_count=3):
+        jobs = []
+        for index_value in range(results_count):
+            jobs.append({
+                'id': 'job-{}'.format(index_value + 1),
+                'interval_seconds': 1,
+                'target': {'type': 'sonarr', 'identity': ('sonarr', 'http://target')},
+            })
+        return {'instances': {}, 'jobs': jobs}
+
+    def test_jobs_run_once_in_order_and_failures_do_not_stop_later_jobs(self):
+        config = self.make_config()
+        called = []
+
+        def execute_job(unused_config, job, unused_clients, run_context=None):
+            called.append(job['id'])
+            return job['id'] != 'job-2'
+
+        with patch('multi_sync._create_clients', return_value={}), \
+                patch('multi_sync.run_job', side_effect=execute_job):
+            result = run_once(config)
+
+        self.assertEqual(result, 1)
+        self.assertEqual(called, ['job-1', 'job-2', 'job-3'])
+
+    def test_all_successful_jobs_return_zero(self):
+        config = self.make_config(results_count=2)
+        called = []
+
+        def execute_job(unused_config, job, unused_clients, run_context=None):
+            called.append(job['id'])
+            return True
+
+        with patch('multi_sync._create_clients', return_value={}), \
+                patch('multi_sync.run_job', side_effect=execute_job):
+            result = run_once(config)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(called, ['job-1', 'job-2'])
+
+    def test_entrypoint_selects_once_mode_and_preserves_default_runner(self):
+        with patch('index.load_multi_job_config', return_value={'reinitialize_b': True}), \
+                patch('multi_sync.run_once', return_value=1) as one_time, \
+                patch('multi_sync.run') as continuous, \
+                patch('index._wait_for_container_stop') as idle:
+            with self.assertLogs(level='WARNING') as logs:
+                self.assertEqual(index.main(), 1)
+        one_time.assert_called_once()
+        idle.assert_called_once()
+        continuous.assert_not_called()
+        self.assertIn('One-time run finished with status 1', logs.output[0])
+        self.assertIn('\x1b[31m', logs.output[0])
+
+        with patch('index.load_multi_job_config', return_value={'reinitialize_b': False}), \
+                patch('multi_sync.run_once') as one_time, \
+                patch('multi_sync.run') as continuous:
+            self.assertEqual(index.main(), 0)
+        one_time.assert_not_called()
+        continuous.assert_called_once()
 
 
 class SonarrEpisodePlanTests(unittest.TestCase):
