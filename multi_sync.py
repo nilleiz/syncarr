@@ -448,7 +448,16 @@ def _items_for_deletion(target_items, incoming_jobs, source_snapshots, target_cl
     source_keys = {}
     for job in incoming_jobs:
         contents = source_snapshots[job['source']['identity']]['contents']
-        source_keys[job['id']] = set(key for key in (_content_key(item, arr_type) for item in contents) if key is not None)
+        keys = set()
+        for item in contents:
+            # Radarr deletion presence is based on an actual source file, but is
+            # intentionally independent of profile and file-quality sync filters.
+            if arr_type == 'radarr' and item.get('hasFile') is not True:
+                continue
+            key = _content_key(item, arr_type)
+            if key is not None:
+                keys.add(key)
+        source_keys[job['id']] = keys
 
     managed_tag_ids = {}
     for job in deleting_jobs:
