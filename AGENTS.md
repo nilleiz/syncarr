@@ -24,6 +24,7 @@
 
 ## Change hygiene
 
+- Treat `syncarr/syncarr` as upstream. Work against it only when explicitly instructed, and send changes there exclusively through pull requests; never push directly to upstream branches.
 - Keep credentials, live endpoint details, private media names, operational stack data, and other user-specific usage information out of tracked files.
 - Update this file when project architecture or agreed multi-job behavior changes. Record only general implementation facts and decisions.
 
