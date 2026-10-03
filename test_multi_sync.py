@@ -49,13 +49,16 @@ class FakeSonarrAddTarget(object):
 
 
 class FakeRadarrClient(object):
-    def __init__(self, identity, items=None, error=None):
+    def __init__(self, identity, items=None, error=None, movie_file_error=None):
         self.identity = identity
         self.arr_type = 'radarr'
         self.content_route = 'movie'
         self.url = identity[1]
         self.items = list(items or [])
         self.error = error
+        self.movie_file_error = movie_file_error
+        self.movie_files = {}
+        self.movie_file_calls = []
         self.tag_ids = {}
         self.deleted_movies = []
         self.list_content_calls = 0
@@ -65,6 +68,12 @@ class FakeRadarrClient(object):
         if self.error:
             raise self.error
         return list(self.items)
+
+    def list_movie_files(self, movie_id):
+        self.movie_file_calls.append(movie_id)
+        if self.movie_file_error:
+            raise self.movie_file_error
+        return list(self.movie_files.get(movie_id, []))
 
     def profile_id(self, name, explicit_id, setting_name):
         return explicit_id
@@ -122,6 +131,7 @@ def _job(job_id, source, target, tag_id, **changes):
         'source_custom_format_minimum_score': None,
         'has_file_filters': True,
         'delete_missing': False,
+        'delete_if_filter_not_matching': False,
         'delete_scope': 'managed_only',
         'delete_files': False,
         'test_run': False,
@@ -200,9 +210,14 @@ class RadarrDeletionPresenceTests(unittest.TestCase):
         source = FakeRadarrClient(('radarr', 'http://source'), source_movies)
         target_item = {'id': 20, 'tmdbId': 100, 'tags': [7]}
         target = FakeRadarrClient(('radarr', 'http://target'), [target_item])
-        job = _job('delete', source, target, 7,
-                   delete_missing=True, delete_scope='all_missing',
-                   has_file_filters=False, source_quality_match=None, **changes)
+        options = {
+            'delete_missing': True,
+            'delete_scope': 'all_missing',
+            'has_file_filters': False,
+            'source_quality_match': None,
+        }
+        options.update(changes)
+        job = _job('delete', source, target, 7, **options)
         return source, target, job, target_item
 
     def deletion_candidates(self, job, source_movies, target, target_item):
@@ -258,6 +273,277 @@ class RadarrDeletionPresenceTests(unittest.TestCase):
         self.assertFalse(_passes_filters(source_movie, source_a, job_a, 99, set()))
         self.assertFalse(_passes_file_filters(nonmatching_file, job_a))
         self.assertEqual(candidates, [])
+
+    def test_enabled_job_treats_no_matching_file_as_missing(self):
+        source, target, job, target_item = self.make_fixture(
+            [{'id': 10, 'tmdbId': 100, 'hasFile': True}],
+            delete_if_filter_not_matching=True,
+            has_file_filters=True,
+            source_quality_match='^Bluray-2160p$',
+            source_custom_format_mode='any',
+            source_custom_format_names=['DV'],
+            source_custom_format_exclude_names=[])
+        snapshots = {
+            source.identity: {
+                'contents': source.items,
+                'movie_files': {10: [{
+                    'id': 101,
+                    'quality': {'quality': {'name': 'Bluray-2160p'}},
+                    'customFormats': [],
+                }]},
+            },
+        }
+
+        candidates = _items_for_deletion([target_item], [job], snapshots, target)
+
+        self.assertEqual([item['id'] for item, unused_authors in candidates], [20])
+
+    def test_matching_file_protects_even_when_another_file_mismatches(self):
+        source, target, job, target_item = self.make_fixture(
+            [{'id': 10, 'tmdbId': 100, 'hasFile': True}],
+            delete_if_filter_not_matching=True,
+            has_file_filters=True,
+            source_quality_match='^Bluray-2160p$',
+            source_custom_format_mode='any',
+            source_custom_format_names=['DV'],
+            source_custom_format_exclude_names=[])
+        snapshots = {
+            source.identity: {
+                'contents': source.items,
+                'movie_files': {10: [
+                    {'id': 101,
+                     'quality': {'quality': {'name': 'WEBDL-1080p'}},
+                     'customFormats': [{'name': 'DV'}]},
+                    {'id': 102,
+                     'quality': {'quality': {'name': 'Bluray-2160p'}},
+                     'customFormats': [{'name': 'DV'}]},
+                ]},
+            },
+        }
+
+        candidates = _items_for_deletion([target_item], [job], snapshots, target)
+
+        self.assertEqual(candidates, [])
+
+    def test_quality_and_custom_format_must_match_on_the_same_file(self):
+        source, target, job, target_item = self.make_fixture(
+            [{'id': 10, 'tmdbId': 100, 'hasFile': True}],
+            delete_if_filter_not_matching=True,
+            has_file_filters=True,
+            source_quality_match='^Bluray-2160p$',
+            source_custom_format_mode='any',
+            source_custom_format_names=['DV'],
+            source_custom_format_exclude_names=[])
+        snapshots = {
+            source.identity: {
+                'contents': source.items,
+                'movie_files': {10: [
+                    {'id': 101,
+                     'quality': {'quality': {'name': 'Bluray-2160p'}},
+                     'customFormats': []},
+                    {'id': 102,
+                     'quality': {'quality': {'name': 'WEBDL-1080p'}},
+                     'customFormats': [{'name': 'DV'}]},
+                ]},
+            },
+        }
+
+        candidates = _items_for_deletion([target_item], [job], snapshots, target)
+
+        self.assertEqual([item['id'] for item, unused_authors in candidates], [20])
+
+    def test_keep_if_any_source_uses_each_jobs_filter_presence(self):
+        source_a = FakeRadarrClient(('radarr', 'http://source-a'))
+        source_b = FakeRadarrClient(('radarr', 'http://source-b'))
+        target_item = {'id': 20, 'tmdbId': 100, 'tags': [7, 8]}
+        target = FakeRadarrClient(('radarr', 'http://target'), [target_item])
+        common = {
+            'delete_missing': True,
+            'delete_scope': 'all_missing',
+            'delete_if_filter_not_matching': True,
+            'has_file_filters': True,
+            'source_quality_match': None,
+            'source_custom_format_mode': 'any',
+            'source_custom_format_names': ['DV'],
+            'source_custom_format_exclude_names': [],
+        }
+        job_a = _job('source-a', source_a, target, 7, **common)
+        job_b = _job('source-b', source_b, target, 8, **common)
+        movie = {'id': 10, 'tmdbId': 100, 'hasFile': True}
+        snapshots = {
+            source_a.identity: {
+                'contents': [movie],
+                'movie_files': {10: [{'id': 101, 'customFormats': []}]},
+            },
+            source_b.identity: {
+                'contents': [dict(movie, id=11)],
+                'movie_files': {11: [{'id': 111, 'customFormats': [{'name': 'DV'}]}]},
+            },
+        }
+
+        self.assertEqual(
+            _items_for_deletion([target_item], [job_a, job_b], snapshots, target), [])
+
+        snapshots[source_b.identity]['movie_files'][11] = [{'id': 111, 'customFormats': []}]
+        candidates = _items_for_deletion([target_item], [job_a, job_b], snapshots, target)
+        self.assertEqual([job['id'] for job in candidates[0][1]], ['source-a', 'source-b'])
+
+    def test_filter_deletion_flag_is_inert_without_delete_missing(self):
+        source_a = FakeRadarrClient(('radarr', 'http://source-a'))
+        source_b = FakeRadarrClient(('radarr', 'http://source-b'))
+        target_item = {'id': 20, 'tmdbId': 100, 'tags': [7]}
+        target = FakeRadarrClient(('radarr', 'http://target'), [target_item])
+        job_a = _job('source-a', source_a, target, 7,
+                     delete_missing=False, delete_if_filter_not_matching=True,
+                     has_file_filters=True, source_quality_match=None,
+                     source_custom_format_mode='any', source_custom_format_names=['DV'],
+                     source_custom_format_exclude_names=[])
+        job_b = _job('source-b', source_b, target, 8,
+                     delete_missing=True, delete_scope='all_missing',
+                     has_file_filters=False, source_quality_match=None)
+        snapshots = {
+            source_a.identity: {'contents': [{'id': 10, 'tmdbId': 100, 'hasFile': True}]},
+            source_b.identity: {'contents': []},
+        }
+
+        candidates = _items_for_deletion([target_item], [job_a, job_b], snapshots, target)
+
+        self.assertEqual(candidates, [])
+
+    def test_source_rule_wins_uses_only_the_deleting_job_filter_presence(self):
+        source_a = FakeRadarrClient(('radarr', 'http://source-a'))
+        source_b = FakeRadarrClient(('radarr', 'http://source-b'))
+        target_item = {'id': 20, 'tmdbId': 100, 'tags': [7, 8]}
+        target = FakeRadarrClient(('radarr', 'http://target'), [target_item])
+        target_policy = 'source_rule_wins'
+        job_a = _job('source-a', source_a, target, 7,
+                     delete_missing=True, delete_scope='all_missing',
+                     delete_if_filter_not_matching=True, has_file_filters=True,
+                     source_quality_match=None, source_custom_format_mode='any',
+                     source_custom_format_names=['DV'], source_custom_format_exclude_names=[])
+        job_b = _job('source-b', source_b, target, 8,
+                     delete_missing=True, delete_scope='all_missing',
+                     delete_if_filter_not_matching=True, has_file_filters=True,
+                     source_quality_match=None, source_custom_format_mode='any',
+                     source_custom_format_names=['DV'], source_custom_format_exclude_names=[])
+        job_a['target']['delete_conflict_policy'] = target_policy
+        job_b['target']['delete_conflict_policy'] = target_policy
+        movie = {'id': 10, 'tmdbId': 100, 'hasFile': True}
+        snapshots = {
+            source_a.identity: {
+                'contents': [movie],
+                'movie_files': {10: [{'id': 101, 'customFormats': []}]},
+            },
+            source_b.identity: {
+                'contents': [dict(movie, id=11)],
+                'movie_files': {11: [{'id': 111, 'customFormats': [{'name': 'DV'}]}]},
+            },
+        }
+
+        candidates = _items_for_deletion([target_item], [job_a, job_b], snapshots, target)
+
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual([job['id'] for job in candidates[0][1]], ['source-a'])
+
+    def test_unknown_required_file_metadata_fails_closed(self):
+        source, target, job, target_item = self.make_fixture(
+            [{'id': 10, 'tmdbId': 100, 'hasFile': True}],
+            delete_if_filter_not_matching=True,
+            has_file_filters=True,
+            source_quality_match=None,
+            source_custom_format_mode='any',
+            source_custom_format_names=['DV'],
+            source_custom_format_exclude_names=[])
+        snapshots = {
+            source.identity: {
+                'contents': source.items,
+                'movie_files': {10: [{'id': 101}]},
+            },
+        }
+
+        with self.assertRaisesRegex(SyncError, 'incomplete filter metadata'):
+            _items_for_deletion([target_item], [job], snapshots, target)
+
+        source.movie_files[10] = [{'id': 101}]
+        clients = {source.identity: source, target.identity: target}
+        run_job({'jobs': [job]}, job, clients)
+        self.assertEqual(target.deleted_movies, [])
+
+    def test_movie_file_inventory_error_prevents_radarr_deletion(self):
+        source_a = FakeRadarrClient(('radarr', 'http://source-a'))
+        source_b = FakeRadarrClient(
+            ('radarr', 'http://source-b'),
+            [{'id': 11, 'tmdbId': 100, 'hasFile': True}],
+            movie_file_error=SyncError('inventory unavailable'))
+        target = FakeRadarrClient(
+            ('radarr', 'http://target'), [{'id': 20, 'tmdbId': 100, 'tags': [7]}])
+        job_a = _job('source-a', source_a, target, 7,
+                     delete_missing=True, delete_scope='all_missing',
+                     has_file_filters=False, source_quality_match=None)
+        job_b = _job('source-b', source_b, target, 8,
+                     delete_missing=True, delete_scope='all_missing',
+                     delete_if_filter_not_matching=True,
+                     has_file_filters=True, source_quality_match=None,
+                     source_custom_format_mode='any',
+                     source_custom_format_names=['DV'],
+                     source_custom_format_exclude_names=[])
+        config = {'jobs': [job_a, job_b]}
+        clients = {
+            source_a.identity: source_a,
+            source_b.identity: source_b,
+            target.identity: target,
+        }
+
+        run_job(config, job_a, clients)
+
+        self.assertEqual(source_b.movie_file_calls, [11])
+        self.assertEqual(target.deleted_movies, [])
+
+    def test_current_job_movie_file_error_stops_before_deletion(self):
+        source = FakeRadarrClient(
+            ('radarr', 'http://source'),
+            [{'id': 10, 'tmdbId': 100, 'hasFile': True}],
+            movie_file_error=SyncError('inventory unavailable'))
+        target = FakeRadarrClient(
+            ('radarr', 'http://target'), [{'id': 20, 'tmdbId': 100, 'tags': [7]}])
+        job = _job('delete', source, target, 7,
+                   delete_missing=True, delete_scope='all_missing',
+                   delete_if_filter_not_matching=True, has_file_filters=True,
+                   source_quality_match=None, source_custom_format_mode='any',
+                   source_custom_format_names=['DV'], source_custom_format_exclude_names=[])
+        config = {'jobs': [job]}
+        clients = {source.identity: source, target.identity: target}
+
+        run_job(config, job, clients)
+
+        self.assertEqual(source.movie_file_calls, [10])
+        self.assertEqual(target.deleted_movies, [])
+
+    def test_filter_mismatch_delete_log_reports_existing_source_file(self):
+        source = FakeRadarrClient(
+            ('radarr', 'http://source'),
+            [{'id': 10, 'tmdbId': 100, 'title': 'Filtered Movie', 'hasFile': True}])
+        source.movie_files[10] = [{'id': 101, 'customFormats': []}]
+        target_item = {'id': 20, 'tmdbId': 100, 'title': 'Filtered Movie', 'tags': [7]}
+        target = FakeRadarrClient(('radarr', 'http://target'), [target_item])
+        job = _job('delete', source, target, 7,
+                   delete_missing=True, delete_scope='all_missing',
+                   delete_if_filter_not_matching=True, has_file_filters=True,
+                   source_quality_match=None, source_custom_format_mode='any',
+                   source_custom_format_names=['DV'], source_custom_format_exclude_names=[])
+        config = {'jobs': [job]}
+        clients = {source.identity: source, target.identity: target}
+
+        with self.assertLogs('syncarr', level='INFO') as captured:
+            run_job(config, job, clients)
+
+        event = next(item for item in _entity_events(captured)
+                     if item['action'] == 'delete_movie')
+        self.assertEqual(event['reason'], 'source_file_filter_mismatch')
+        self.assertTrue(event['source_has_file'])
+        self.assertTrue(event['source_filter_mismatch'])
+        self.assertEqual(source.movie_file_calls, [10])
+        self.assertEqual(target.deleted_movies, [(20, False)])
 
     def test_source_inventory_error_prevents_radarr_deletion(self):
         source_a = FakeRadarrClient(('radarr', 'http://source-a'))
