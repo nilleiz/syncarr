@@ -129,6 +129,7 @@ def _load_environment_config(env):
             'sync_monitor': env.get(prefix + '_SYNC_MONITOR', '0'),
             'test_run': env.get(prefix + '_TEST_RUN', global_test_run),
             'delete_missing': env.get(prefix + '_DELETE_MISSING', '0'),
+            'delete_if_filter_not_matching': env.get(prefix + '_DELETE_IF_FILTER_NOT_MATCHING', '0'),
             'delete_scope': env.get(prefix + '_DELETE_SCOPE', 'managed_only'),
             'delete_files': env.get(prefix + '_DELETE_FILES', '0'),
         }
@@ -233,11 +234,16 @@ def _normalize_job(raw, index, instances, global_test_run):
         'sync_monitor': _boolean(raw.get('sync_monitor', False), 'sync_monitor'),
         'test_run': _boolean(raw.get('test_run', global_test_run), 'test_run'),
         'delete_missing': _boolean(raw.get('delete_missing', False), 'delete_missing'),
+        'delete_if_filter_not_matching': _boolean(
+            raw.get('delete_if_filter_not_matching', False), 'delete_if_filter_not_matching'),
         'delete_scope': scope,
         'delete_files': _boolean(raw.get('delete_files', False), 'delete_files'),
     }
     if job['target_profile'] is None and job['target_profile_id'] is None:
         raise ConfigurationError('Job {} needs target_profile or target_profile_id'.format(job_id))
+    if job['delete_if_filter_not_matching'] and source['type'] != 'radarr':
+        raise ConfigurationError(
+            'Job {} delete_if_filter_not_matching is supported for Radarr only'.format(job_id))
     if _optional_text(raw.get('target_language')) or _optional_text(raw.get('target_language_id')):
         raise ConfigurationError(
             'Job {} target language settings are legacy Sonarr v3 only'.format(job_id))

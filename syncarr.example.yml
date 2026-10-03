@@ -30,6 +30,8 @@ jobs:
     #   - Dolby Vision without fallback
     # source_custom_format_exclude_names:
     #   - HDR10 fallback
+    # Radarr only: with delete_missing enabled, allow filter-mismatching files to count as missing.
+    # delete_if_filter_not_matching: false
     skip_missing: true
     auto_search: true
     monitor_new_content: true

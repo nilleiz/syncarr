@@ -28,6 +28,10 @@ class SyncError(Exception):
     """A remote request or sync operation failed without exposing credentials."""
 
 
+class MovieFileInventoryError(SyncError):
+    """A required Radarr movie-file inventory could not be read."""
+
+
 class ArrClient(object):
     def __init__(self, instance):
         self.instance = instance
@@ -303,6 +307,103 @@ def _passes_file_filters(file_record, job):
     return True
 
 
+def _filter_aware_deletion_enabled(job):
+    return bool(job['delete_missing'] and job.get('delete_if_filter_not_matching') and
+                job['has_file_filters'])
+
+
+def _deletion_file_filter_match(file_record, job):
+    """Return True/False for known metadata, or None when a required field is unknown."""
+    if not isinstance(file_record, dict):
+        return None
+
+    if job['source_quality_match']:
+        quality = file_record.get('quality')
+        nested_quality = quality.get('quality') if isinstance(quality, dict) else None
+        quality_name = nested_quality.get('name') if isinstance(nested_quality, dict) else None
+        if not isinstance(quality_name, str) or not quality_name.strip():
+            return None
+
+    mode = job['source_custom_format_mode']
+    if mode == 'score':
+        if 'customFormatScore' not in file_record:
+            return None
+        raw_score = file_record.get('customFormatScore')
+        if isinstance(raw_score, bool) or raw_score is None:
+            return None
+        try:
+            parsed_score = int(raw_score)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(raw_score, float) and not raw_score.is_integer():
+            return None
+        if isinstance(raw_score, str) and str(parsed_score) != raw_score.strip():
+            return None
+    elif mode in ('any', 'all'):
+        if 'customFormats' not in file_record or not isinstance(file_record['customFormats'], list):
+            return None
+        for custom_format in file_record['customFormats']:
+            if (not isinstance(custom_format, dict) or
+                    not isinstance(custom_format.get('name'), str) or
+                    not custom_format['name'].strip()):
+                return None
+
+    return _passes_file_filters(file_record, job)
+
+
+def _movie_files_match_filters(file_records, job):
+    """Fail closed if no known match exists and any required metadata is incomplete."""
+    if not isinstance(file_records, list) or not file_records:
+        raise SyncError('Radarr movie-file inventory was empty or invalid for a movie with hasFile true')
+    saw_unknown = False
+    for file_record in file_records:
+        match = _deletion_file_filter_match(file_record, job)
+        if match is True:
+            return True
+        if match is None:
+            saw_unknown = True
+    if saw_unknown:
+        raise SyncError('Radarr movie-file inventory has incomplete filter metadata')
+    return False
+
+
+def _cached_movie_files(source_client, movie_id, cache):
+    cache_key = (source_client.identity, movie_id)
+    if cache_key not in cache:
+        try:
+            cache[cache_key] = source_client.list_movie_files(movie_id)
+        except SyncError as error:
+            raise MovieFileInventoryError(
+                'Radarr movie-file inventory request failed ({})'.format(error))
+    return cache[cache_key]
+
+
+def _load_radarr_movie_file_inventories(incoming_jobs, source_snapshots, clients, cache):
+    """Read every file inventory needed by deletion before planning any deletes."""
+    for job in incoming_jobs:
+        if not _filter_aware_deletion_enabled(job):
+            continue
+        source_identity = job['source']['identity']
+        snapshot = source_snapshots[source_identity]
+        movie_files = snapshot.setdefault('movie_files', {})
+        source_client = clients[source_identity]
+        for item in snapshot['contents']:
+            if not isinstance(item, dict):
+                raise SyncError('Radarr source inventory contained an invalid movie record')
+            if item.get('hasFile') is not True or _content_key(item, 'radarr') is None:
+                continue
+            movie_id = item.get('id')
+            if movie_id is None:
+                raise SyncError('Radarr source movie has no ID for its movie-file inventory')
+            if movie_id not in movie_files:
+                records = _cached_movie_files(source_client, movie_id, cache)
+                if not isinstance(records, list):
+                    raise SyncError('Radarr movie-file response was not a list')
+                if not records:
+                    raise SyncError('Radarr source movie reports hasFile true but has no movie-file records')
+                movie_files[movie_id] = records
+
+
 def _episode_key(external_id, episode):
     try:
         season_number = int(episode.get('seasonNumber'))
@@ -416,8 +517,10 @@ def _prepare_job(job, clients, create_tags):
     return source_client, target_client, tag_id
 
 
-def _sync_items(job, source_client, target_client, tag_id, source_items, target_items, episode_cache=None):
+def _sync_items(job, source_client, target_client, tag_id, source_items, target_items,
+                episode_cache=None, movie_file_cache=None):
     episode_cache = {} if episode_cache is None else episode_cache
+    movie_file_cache = {} if movie_file_cache is None else movie_file_cache
     profile_filter_id, tag_filter_ids = _resolve_source_filters(source_client, job)
     arr_type = source_client.arr_type
     target_by_key = {}
@@ -434,7 +537,8 @@ def _sync_items(job, source_client, target_client, tag_id, source_items, target_
         matching_episodes = None
         if source_client.arr_type == 'radarr' and job['has_file_filters']:
             movie_id = content.get('id')
-            files = source_client.list_movie_files(movie_id) if movie_id is not None else []
+            files = (_cached_movie_files(source_client, movie_id, movie_file_cache)
+                     if movie_id is not None else [])
             if not any(_passes_file_filters(file_record, job) for file_record in files):
                 _log_entity(job, target_client, 'skip', 'source_file_filters', content,
                             level=logging.DEBUG)
@@ -515,15 +619,23 @@ def _items_for_deletion(target_items, incoming_jobs, source_snapshots, target_cl
     arr_type = target_client.arr_type
     source_keys = {}
     for job in incoming_jobs:
-        contents = source_snapshots[job['source']['identity']]['contents']
+        snapshot = source_snapshots[job['source']['identity']]
+        contents = snapshot['contents']
         keys = set()
         for item in contents:
-            # Radarr deletion presence is based on an actual source file, but is
-            # intentionally independent of profile and file-quality sync filters.
+            if arr_type == 'radarr' and not isinstance(item, dict):
+                raise SyncError('Radarr source inventory contained an invalid movie record')
             if arr_type == 'radarr' and item.get('hasFile') is not True:
                 continue
             key = _content_key(item, arr_type)
             if key is not None:
+                if arr_type == 'radarr' and _filter_aware_deletion_enabled(job):
+                    movie_id = item.get('id')
+                    movie_files = snapshot.get('movie_files', {})
+                    if movie_id is None or movie_id not in movie_files:
+                        raise SyncError('Required Radarr movie-file inventory is unavailable')
+                    if not _movie_files_match_filters(movie_files[movie_id], job):
+                        continue
                 keys.add(key)
         source_keys[job['id']] = keys
 
@@ -559,6 +671,13 @@ def _items_for_deletion(target_items, incoming_jobs, source_snapshots, target_cl
             # authorizes this deletion must also allow removal of the media file.
             candidates.append((item, authors))
     return candidates
+
+
+def _source_movie_has_file(job, target_item, source_snapshots):
+    key = _content_key(target_item, 'radarr')
+    contents = source_snapshots[job['source']['identity']]['contents']
+    return any(item.get('hasFile') is True and _content_key(item, 'radarr') == key
+               for item in contents)
 
 
 def _target_group(config, target_identity):
@@ -849,8 +968,14 @@ def run_job(config, job, clients):
     source_items = source_client.list_content()
     target_items = target_client.list_content()
     episode_cache = {}
-    _sync_items(job, source_client, target_client, tag_id, source_items, target_items,
-                episode_cache=episode_cache)
+    movie_file_cache = {}
+    try:
+        _sync_items(job, source_client, target_client, tag_id, source_items, target_items,
+                    episode_cache=episode_cache, movie_file_cache=movie_file_cache)
+    except MovieFileInventoryError as error:
+        LOGGER.error('Job %s will not continue because its source movie-file inventory failed (%s)',
+                     job['id'], error)
+        return
 
     if target_client.arr_type == 'sonarr':
         incoming_jobs = _target_group(config, target_client.identity)
@@ -897,16 +1022,35 @@ def run_job(config, job, clients):
     if not safe_to_delete:
         return
 
-    candidates = _items_for_deletion(target_items, incoming_jobs, source_snapshots, target_client)
+    try:
+        _load_radarr_movie_file_inventories(
+            incoming_jobs, source_snapshots, clients, movie_file_cache)
+    except SyncError as error:
+        LOGGER.error('Job %s will not delete from its target because a required source movie-file inventory was unavailable or incomplete (%s)',
+                     job['id'], error)
+        return
+    try:
+        candidates = _items_for_deletion(
+            target_items, incoming_jobs, source_snapshots, target_client)
+    except SyncError as error:
+        LOGGER.error('Job %s will not delete from its target because deletion planning data was unavailable or incomplete (%s)',
+                     job['id'], error)
+        return
+
     for item, authors in candidates:
         if job not in authors:
             continue
+        source_has_file = _source_movie_has_file(job, item, source_snapshots)
+        source_filter_mismatch = bool(source_has_file and _filter_aware_deletion_enabled(job))
+        reason = 'source_file_filter_mismatch' if source_filter_mismatch else 'missing_from_source'
         live_authors = [author for author in authors if not author['test_run']]
         effective_authors = live_authors or authors
         delete_files = all(author['delete_files'] for author in effective_authors)
-        _log_entity(job, target_client, 'delete_movie', 'missing_from_source', item,
+        _log_entity(job, target_client, 'delete_movie', reason, item,
                     entity_side='target', target_record_id=item.get('id'),
-                    source_has_file=False, delete_files=delete_files,
+                    source_has_file=source_has_file,
+                    source_filter_mismatch=source_filter_mismatch,
+                    delete_files=delete_files,
                     author_job_ids=sorted(author['id'] for author in authors),
                     author_source_instances=sorted(set(
                         author.get('source_instance_id') or author['source'].get('id')
