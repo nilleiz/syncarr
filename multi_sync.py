@@ -1266,10 +1266,6 @@ def _reinitialize_radarr_target(incoming_jobs, target_client, initial_target_ids
                 if source_profile_id not in target_profile_maps.get(job['pair_id'], {}):
                     continue
 
-            root_path = _path_for_content(source_movie, job, target_client)
-            if not root_path:
-                continue
-
             if job['has_file_filters']:
                 movie_id = source_movie.get('id')
                 if movie_id is None:
@@ -1300,28 +1296,29 @@ def _reinitialize_radarr_target(incoming_jobs, target_client, initial_target_ids
                     continue
                 else:
                     continue
-            qualifying_jobs.append((job, root_path, source_movie))
+            # Recovery only changes monitoring and starts a search on a movie
+            # already present on B; its eligibility does not depend on root mapping.
+            qualifying_jobs.append((job, source_movie))
 
         if not qualifying_jobs:
             continue
 
-        root_demands = {_path_key(root_path) for unused_job, root_path, unused_movie in qualifying_jobs}
         profile_demands = {
             target_profile_id
-            for job, unused_root, source_movie in qualifying_jobs
+            for job, source_movie in qualifying_jobs
             if job.get('is_pair_rule')
             for target_profile_id in [target_profile_maps.get(job['pair_id'], {}).get(
                 _quality_profile_key(source_movie.get('qualityProfileId')))]
             if target_profile_id is not None
         }
-        if len(root_demands) > 1 or len(profile_demands) > 1:
+        if len(profile_demands) > 1:
             LOGGER.warning('Radarr recovery skipped a conflicting target movie %s under rules %s',
                            key, ','.join(sorted(_rule_label(job)
-                                                for job, unused_root, unused_movie in qualifying_jobs)))
+                                                for job, unused_movie in qualifying_jobs)))
             success = False
             continue
 
-        live_jobs = [job for job, unused_root, unused_movie in qualifying_jobs if not job['test_run']]
+        live_jobs = [job for job, unused_movie in qualifying_jobs if not job['test_run']]
         action_job = live_jobs[0] if live_jobs else qualifying_jobs[0][0]
         mode = 'live' if live_jobs else 'dry_run'
         outcome = 'attempted' if live_jobs else 'would_apply'
@@ -1330,10 +1327,10 @@ def _reinitialize_radarr_target(incoming_jobs, target_client, initial_target_ids
             'target_has_file': False,
             'source_has_file': True,
             'qualifying_job_ids': sorted(
-                job['id'] for job, unused_root, unused_movie in qualifying_jobs
+                job['id'] for job, unused_movie in qualifying_jobs
                 if not job.get('is_pair_rule')),
             'qualifying_rules': sorted(_rule_label(job)
-                                       for job, unused_root, unused_movie in qualifying_jobs),
+                                       for job, unused_movie in qualifying_jobs),
         }
 
         if not target_movie.get('monitored', False):
