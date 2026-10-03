@@ -8,3 +8,9 @@ env/
 
 dev-config.conf
 output.txt
+.git/
+.env
+.env.*
+config.conf
+syncarr.yml
+syncarr.local.yml
