@@ -30,6 +30,10 @@ def load_multi_job_config(environ=None):
 
     if config_path and has_indexed_config:
         raise ConfigurationError('Set either SYNCARR_CONFIG or indexed SYNCARR_INSTANCE/JOB variables, not both')
+    if not config_path and not has_indexed_config:
+        if _boolean(env.get('SYNCARR_REINITIALIZE_B', '0'), 'SYNCARR_REINITIALIZE_B'):
+            raise ConfigurationError('SYNCARR_REINITIALIZE_B requires multi-job configuration')
+        return None
     if config_path:
         return _load_yaml_config(config_path, env)
     if has_indexed_config:
@@ -75,9 +79,11 @@ def _load_yaml_config(path, env):
             str(instance_id), raw.get('type'), url, api_key, raw.get('delete_conflict_policy'))
 
     global_test_run = _boolean(data.get('test_run', env.get('SYNCARR_TEST_RUN', '0')), 'test_run')
+    reinitialize_b = _boolean(
+        data.get('reinitialize_b', env.get('SYNCARR_REINITIALIZE_B', '0')), 'reinitialize_b')
     jobs = [_normalize_job(raw, index, instances, global_test_run)
             for index, raw in enumerate(raw_jobs, start=1)]
-    return _finish_config(instances, jobs, global_test_run)
+    return _finish_config(instances, jobs, global_test_run, reinitialize_b)
 
 
 def _load_environment_config(env):
@@ -97,6 +103,7 @@ def _load_environment_config(env):
             env.get(prefix + '_DELETE_CONFLICT_POLICY'))
 
     global_test_run = _boolean(env.get('SYNCARR_TEST_RUN', '0'), 'SYNCARR_TEST_RUN')
+    reinitialize_b = _boolean(env.get('SYNCARR_REINITIALIZE_B', '0'), 'SYNCARR_REINITIALIZE_B')
     jobs = []
     for index in range(1, job_count + 1):
         prefix = 'SYNCARR_JOB_{}'.format(index)
@@ -145,7 +152,7 @@ def _load_environment_config(env):
         raw['root_mappings'] = mappings
         jobs.append(_normalize_job(raw, index, instances, global_test_run))
 
-    return _finish_config(instances, jobs, global_test_run)
+    return _finish_config(instances, jobs, global_test_run, reinitialize_b)
 
 
 def _normalize_instance(instance_id, arr_type, url, api_key, conflict_policy=None):
@@ -282,7 +289,7 @@ def _normalize_job(raw, index, instances, global_test_run):
     return job
 
 
-def _finish_config(instances, jobs, test_run):
+def _finish_config(instances, jobs, test_run, reinitialize_b=False):
     ids = [job['id'] for job in jobs]
     if len(ids) != len(set(ids)):
         raise ConfigurationError('Job ids must be unique')
@@ -296,7 +303,12 @@ def _finish_config(instances, jobs, test_run):
         if current and current != policy_and_key:
             raise ConfigurationError('Aliases for the same instance must use one API key and delete_conflict_policy')
         policies_by_target[identity] = policy_and_key
-    return {'instances': instances, 'jobs': jobs, 'test_run': test_run}
+    return {
+        'instances': instances,
+        'jobs': jobs,
+        'test_run': test_run,
+        'reinitialize_b': reinitialize_b,
+    }
 
 
 def _required(env, name):

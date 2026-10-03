@@ -1,6 +1,8 @@
 # Copy this file to a private config location and mount it into the container.
 # Put endpoint URLs and API keys in environment variables; never add keys here.
 test_run: true
+# Optional one-time run: execute every job once, then stay idle until the container is stopped.
+reinitialize_b: false
 
 instances:
   source_a:
