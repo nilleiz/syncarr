@@ -26,3 +26,10 @@
 
 - Keep credentials, live endpoint details, private media names, operational stack data, and other user-specific usage information out of tracked files.
 - Update this file when project architecture or agreed multi-job behavior changes. Record only general implementation facts and decisions.
+
+
+## Container publishing
+
+- The container workflow builds `linux/amd64` and `linux/arm64`. Pull requests build without publishing; pushes to the default branch publish `latest`, and numeric version tags publish matching tags.
+- GHCR publishing uses the workflow's `GITHUB_TOKEN` with package-write permission. Link images to the source repository with the OCI source label.
+- Keep local `.env` files and private runtime configuration out of Git and Docker build contexts. Compose examples use placeholders and mount runtime configuration read-only.
