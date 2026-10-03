@@ -111,55 +111,39 @@ Syncs two Radarr/Sonarr/Lidarr servers through the web API. Useful for syncing a
 
 ---
 ## Docker Compose
-This script can run through a docker container with a set interval (default every 5 minutes)
+Copy the sample config and create a local `.env` with the values it references. Keep both files private; `.env` and `syncarr.yml` are ignored by Git and excluded from the image build.
 
 ```bash
-syncarr:
-    image: syncarr/syncarr:latest
-    container_name: syncarr
-    restart: unless-stopped
-    environment:
-        RADARR_A_URL: https://4k.example.com:443
-        RADARR_A_KEY: XXXXX
-        RADARR_B_URL: http://127.0.0.1:8080
-        RADARR_B_KEY: XXXXX
-        RADARR_B_PROFILE: 1080p
-        RADARR_B_PATH: /data/Movies
-        SYNC_INTERVAL_SECONDS: 300
+cp syncarr.example.yml syncarr.yml
 ```
 
-or
+Example `compose.yaml`:
 
-```bash
-syncarr:
-    image: syncarr/syncarr:latest
+```yaml
+services:
+  syncarr:
+    image: ${SYNCARR_IMAGE:-ghcr.io/your-namespace/syncarr:latest}
     container_name: syncarr
     restart: unless-stopped
+    env_file: .env
     environment:
-        SONARR_A_URL: https://4k.example.com:443
-        SONARR_A_KEY: XXXXX
-        SONARR_B_URL: http://127.0.0.1:8080
-        SONARR_B_KEY: XXXXX
-        SONARR_B_PROFILE: 1080p
-        SONARR_B_PATH: /data/Shows
-        SYNC_INTERVAL_SECONDS: 300
+      SYNCARR_CONFIG: /config/syncarr.yml
+    volumes:
+      - ./syncarr.yml:/config/syncarr.yml:ro
 ```
 
-or
+Set `SYNCARR_IMAGE` to the public GHCR image path. The local `.env` must define the endpoint URLs and API keys referenced in `syncarr.yml`; keep real values out of source control. The included sample config starts with `test_run: true`.
 
-```bash
-syncarr:
-    image: syncarr/syncarr:latest
-    container_name: syncarr
-    restart: unless-stopped
-    environment:
-        LIDARR_A_URL: https://lossless.example.com:443
-        LIDARR_A_KEY: XXXXX
-        LIDARR_B_URL: http://127.0.0.1:8080
-        LIDARR_B_KEY: XXXXX
-        LIDARR_B_PROFILE: Standard
-        LIDARR_B_PATH: /data/Music
-        SYNC_INTERVAL_SECONDS: 300
+Example local `.env` values (replace placeholders locally; do not commit this file):
+
+```dotenv
+SYNCARR_IMAGE=ghcr.io/your-namespace/syncarr:latest
+RADARR_A_URL=https://radarr-a.example.invalid
+RADARR_A_KEY=replace-with-a-local-key
+RADARR_B_URL=https://radarr-b.example.invalid
+RADARR_B_KEY=replace-with-a-local-key
+RADARR_TARGET_URL=https://radarr-target.example.invalid
+RADARR_TARGET_KEY=replace-with-a-local-key
 ```
 
 ---
@@ -169,7 +153,7 @@ syncarr:
 For just plain docker (radarr example):
 
 ```bash
-docker run -it --rm --name syncarr -e RADARR_A_URL=https://4k.example.com:443 -e RADARR_A_KEY=XXXXX -e RADARR_B_URL=http://127.0.0.1:8080 -e RADARR_B_KEY=XXXXX -e RADARR_B_PROFILE=1080p -e RADARR_B_PATH=/data/Movies -e SYNC_INTERVAL_SECONDS=300 syncarr/syncarr
+docker run -it --rm --name syncarr -e RADARR_A_URL=https://radarr-a.example.invalid -e RADARR_A_KEY=replace-me -e RADARR_B_URL=https://radarr-b.example.invalid -e RADARR_B_KEY=replace-me -e RADARR_B_PROFILE=1080p -e RADARR_B_PATH=/data/Movies -e SYNC_INTERVAL_SECONDS=300 ghcr.io/your-namespace/syncarr:latest
 ```
 
 ## Notes
