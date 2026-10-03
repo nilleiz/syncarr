@@ -41,15 +41,17 @@ Filter skips and already-synced items are available at `DEBUG` level. Logs use i
 
 `root_mappings` maps a source library root to a target library root. The longest matching source prefix is selected, with a directory boundary check. An item whose path matches none of a job's configured mappings is skipped and logged. With no mappings, `target_root_path` is used; if that is also absent, Syncarr uses the item's parent directory as the legacy fallback.
 
-For several sources sharing one target, `keep_if_any_source` is the default conflict policy: an item is retained while any configured source still contains it. For Radarr deletion, a source movie counts as present only when its record has `hasFile: true`. This presence check ignores quality-profile and `source_quality_match` filters, so a file on any source protects the target. `source_rule_wins` is available when each rule should make its own deletion decision.
+For several sources sharing one target, `keep_if_any_source` is the default conflict policy: an item is retained while any configured source's presence rule says it is present. For Radarr, the default rule counts a movie as present when its source record has `hasFile: true`, regardless of file filters. A job can opt into filter-aware deletion with `delete_if_filter_not_matching: true`; together with `delete_missing: true`, a movie with a file counts as present for that job only if at least one source movie file passes that job's `source_quality_match` and custom-format filters. This option is per job and defaults to `false`. A matching file from another source job still protects the target under `keep_if_any_source`; `source_rule_wins` evaluates only the deleting job's own source. Profile, tag, and blacklist filters do not affect this file-presence check.
 
-Deleting missing content is disabled unless a job sets `delete_missing: true`. For Radarr it removes missing movies; for Sonarr it removes target episode-file records when a source episode has no file or no longer passes the configured file filters, and unmonitors that episode. The Sonarr series and episode metadata remain. By default, `delete_scope: managed_only` limits deletion to matching `syncarr-<job-id>` tags; older untagged content needs `all_missing` or a manually added rule tag. `delete_files` defaults to `false`, so the Arr entry is removed while the media file remains on disk. On a shared target, files are physically removed only if every live rule authorizing deletion sets `delete_files: true`. Syncarr skips deletion and episode-state reconciliation for that target if it cannot read a required source inventory.
+Deleting missing content is disabled unless a job sets `delete_missing: true`. Filter-aware Radarr deletion fetches source movie-file inventories before planning target deletes. If a required inventory request fails or required filter metadata is missing or malformed, Syncarr skips deletions for that target in the current run. A source movie reporting `hasFile: true` alongside an empty movie-file inventory also fails closed. For Sonarr, deletion removes target episode-file records when a source episode has no file or no longer passes the configured file filters, and unmonitors that episode; the Sonarr series and episode metadata remain. By default, `delete_scope: managed_only` limits deletion to matching `syncarr-<job-id>` tags; older untagged content needs `all_missing` or a manually added rule tag. `delete_files` defaults to `false`, so the Arr entry is removed while the media file remains on disk. On a shared target, files are physically removed only if every live rule authorizing deletion sets `delete_files: true`.
+
+When Radarr deletion is caused by a filter mismatch, the entity log uses `reason: "source_file_filter_mismatch"`, with `source_has_file: true` and `source_filter_mismatch: true`.
 
 File filters are evaluated against each source movie file or Sonarr episode file. `source_quality_match` is a regular expression matched against the file quality name. Custom-format filters use one of three modes: `any` matches at least one configured name, `all` requires every configured name, and `score` requires a minimum `CustomFormatScore`. Optional excluded names veto matches in `any` and `all` modes. Quality and custom-format conditions are combined with AND on the same file. Names match case-insensitively and exactly. A Sonarr series is added only when at least one episode file matches; matching episodes are monitored, and unmatched or fileless episodes are unmonitored. If multiple jobs address the same target series, matching episode sets are combined so one job cannot unmonitor an episode another job needs.
 
 You can configure multi-job mode entirely with indexed environment variables instead of YAML. Set `SYNCARR_INSTANCE_COUNT` and `SYNCARR_JOB_COUNT`, then provide `SYNCARR_INSTANCE_1_ID`, `_TYPE`, `_URL`, `_API_KEY` and corresponding numbered fields. Job fields use `SYNCARR_JOB_1_ID`, `_SOURCE`, `_TARGET`, `_INTERVAL_SECONDS`, `_ROOT_MAPPING_COUNT`, and `SYNCARR_JOB_1_ROOT_MAPPING_1_SOURCE` / `_TARGET`; optional job settings use the same names as the YAML keys in uppercase. Do not set `SYNCARR_CONFIG` at the same time.
 
-Optional multi-job file-filter fields are `source_quality_match`, `source_custom_format_mode`, `source_custom_format_names`, `source_custom_format_exclude_names`, and `source_custom_format_minimum_score`. In indexed environment configuration, use the matching `SYNCARR_JOB_N_SOURCE_*` names; custom-format name lists are comma-separated. For example:
+Optional multi-job file-filter fields are `source_quality_match`, `source_custom_format_mode`, `source_custom_format_names`, `source_custom_format_exclude_names`, and `source_custom_format_minimum_score`. For Radarr, `delete_if_filter_not_matching` enables the per-job filter-aware deletion behavior described above; indexed environment configuration uses `SYNCARR_JOB_N_DELETE_IF_FILTER_NOT_MATCHING`. In indexed environment configuration, use the matching `SYNCARR_JOB_N_SOURCE_*` names; custom-format name lists are comma-separated. For example:
 
 ```yaml
 source_quality_match: '^Bluray-2160p$'
@@ -58,6 +60,13 @@ source_custom_format_names:
   - Dolby Vision without fallback
 source_custom_format_exclude_names:
   - HDR10 fallback
+```
+
+Radarr only, to let this filtered job delete a target movie when none of its source files pass those filters:
+
+```yaml
+delete_missing: true
+delete_if_filter_not_matching: true
 ```
 
 For score mode, set `source_custom_format_mode: score` and `source_custom_format_minimum_score`; do not set name or exclusion lists. When Sonarr episode filters are active, `auto_search` searches newly monitored matching episodes only. `delete_missing` and `delete_files` remain opt-in; use both as `true` to physically remove the target media file when its source episode disappears or stops matching.
