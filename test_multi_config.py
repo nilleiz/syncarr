@@ -202,6 +202,7 @@ pairs:
             'SYNCARR_INSTANCE_2_URL': 'http://target', 'SYNCARR_INSTANCE_2_API_KEY': 'target-key',
             'SYNCARR_PAIR_1_ID': 'shows', 'SYNCARR_PAIR_1_SOURCE': 'source',
             'SYNCARR_PAIR_1_TARGET': 'target', 'SYNCARR_PAIR_1_INTERVAL_SECONDS': '90',
+            'SYNCARR_PAIR_1_DELETE_MISSING': 'true',
             'SYNCARR_PAIR_1_PROFILE_MAPPING_COUNT': '1',
             'SYNCARR_PAIR_1_PROFILE_MAPPING_1_SOURCE_PROFILE_ID': '1',
             'SYNCARR_PAIR_1_PROFILE_MAPPING_1_TARGET_PROFILE_ID': '2',

@@ -182,7 +182,7 @@ def _path_key(path):
 
 def map_root_path(content_path, job):
     """Map the longest matching source prefix; return (root, error reason)."""
-    mappings = job['root_mappings']
+    mappings = job.get('root_mappings') or []
     if mappings:
         source_path = _path_key(content_path)
         if not source_path:
@@ -205,7 +205,7 @@ def map_root_path(content_path, job):
         unused_length, target_root = max(candidates, key=lambda value: value[0])
         return target_root, None
 
-    if job['target_root_path']:
+    if job.get('target_root_path'):
         return job['target_root_path'], None
     if not content_path:
         return None, 'source path is missing and no target root is configured'
@@ -1773,7 +1773,7 @@ def _run_planned_cycle(config, due_jobs, clients, run_context=None, initial_targ
                                 outcome='would_apply')
                     continue
                 payload = _build_payload(
-                    add_job, representative['content'], target_client, root, None,
+                    representative['content'], add_job, target_client, root, None,
                     matching_episodes=matching_episodes)
                 tag_values = []
                 try:
